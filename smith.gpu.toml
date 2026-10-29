@@ -11,6 +11,10 @@ backend = "http://127.0.0.1:8600"
 hardware = "gpu"
 # Staging for the stores, which live in the bucket; and _logs/.
 runs = "/runs"
+# torch and its CUDA libraries, which the image does not carry: fetched and
+# installed by runtime.py before the first job, from SMITH_RUNTIME_URL when
+# it is set and from the index they were resolved from otherwise.
+runtime = "/app/runtime.json"
 
 # The bucket every run's store goes to, under <prefix>/<run id>. A pod is gone
 # once it stops, and the bucket is what lets a run resume or fork on another.

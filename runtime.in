@@ -1,0 +1,15 @@
+# The heavy part of the GPU image's Python, which the image does not carry:
+# Dockerfile.gpu resolves it to the wheels in runtime.json, and runtime.py
+# fetches and installs them when the node starts (see runtime.py).
+#
+# torch at CUDA 12.8: the oldest line with Blackwell kernels, and it runs on
+# the 570 drivers most rented nodes still have. Pinned with its local version,
+# which only the cu128 index carries: PyPI's own torch is newer and built for
+# CUDA 13, and the first build of this image, which let pip choose, came out
+# 2.14+cu130 - needing a 580 driver, and not seeing the GPU on half the nodes.
+torch==2.11.0+cu128
+# TileLang, for Ravex's quantization kernels (GPU-139): optional in Ravex,
+# here because a GPU node is where they pay. Its compiler, nvcc, is in the
+# image, from NVIDIA's apt repository (see Dockerfile.gpu).
+tilelang==0.1.15
+ml-dtypes>=0.5.1

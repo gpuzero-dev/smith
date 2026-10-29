@@ -63,6 +63,8 @@ jobs:
         run: |
           IMAGE="${IMAGE,,}"
           docker pull -q "$IMAGE"
+          # torch first: the image carries only its lock (runtime.py), and a
+          # wheel is built against the torch the nodes install from it.
           docker run --rm -e SMITH_BACKEND -e SMITH_BUILDER_TOKEN \
             -v "$PWD/builder.py:/builder/builder.py:ro" -v "$PWD/cache.py:/builder/cache.py:ro" \
-            "$IMAGE" python /builder/builder.py
+            "$IMAGE" sh -c "python /app/smith/runtime.py install --manifest /app/runtime.json && python /builder/builder.py"

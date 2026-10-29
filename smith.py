@@ -339,6 +339,11 @@ print("%d GPU(s): %s" % (want, ", ".join(torch.cuda.get_device_name(i) for i in 
 #: tens of seconds, never minutes.
 GPU_CHECK_SECONDS = 180.0
 
+#: How long fetching and installing the runtime may take (``runtime.py``):
+#: about 3.5 GB of wheels, a minute at 500 Mb/s and ten at 50. Past that the
+#: machine is too slow to be worth its price, and says so.
+RUNTIME_SECONDS = 15 * 60.0
+
 
 #: What a job's code may be: a repository over HTTPS, a commit as a full SHA,
 #: a manifest and a script named plainly. Checked before anything runs, so a
@@ -604,6 +609,11 @@ class Config:
     #: through URLs it signs (see "What one machine compiled" above). Off
     #: unless asked for: a backend without one would refuse every pull.
     cache_service: bool = False
+    #: The manifest of the heavy part of this Python - torch, its CUDA
+    #: libraries - which the image does not carry and ``runtime.py`` fetches
+    #: and installs before the first job (``runtime`` in the file); None where
+    #: the environment already has it all.
+    runtime: Optional[str] = None
 
     @classmethod
     def load(cls, path: str) -> "Config":
@@ -660,6 +670,7 @@ class Config:
                 or raw.get("check_gpus", str(env("SMITH_HARDWARE") or raw.get("hardware", "local-cpu")).startswith("gpu"))
             ).lower() in ("true", "1", "yes"),
             cache_service=str(env("SMITH_CACHE") or raw.get("cache", "")).lower() == "backend",
+            runtime=resolve(raw["runtime"]) if raw.get("runtime") else None,
         )
 
 
@@ -1415,6 +1426,38 @@ class Agent:
         #: said in every heartbeat, and no job is taken while it stands.
         self.fault: Optional[str] = None
 
+    def install_runtime(self) -> None:
+        """Fetch and install the heavy part of the job's Python before
+        anything else, the GPU check included, which imports torch.
+
+        Before the first heartbeat too: a backend that heard this agent would
+        hand it a job it could not start yet. Fetching takes a minute or two,
+        well inside the time a backend gives a node to come up. One that
+        fails is this machine's fault, said in every heartbeat, so the
+        backend gives its job to another instead of waiting on this one."""
+        runtime = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime.py")
+        log("installing the runtime from %s" % self.config.runtime)
+        try:
+            done = subprocess.run(
+                [self.config.python, runtime, "install", "--manifest", self.config.runtime,
+                 "--python", self.config.python],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=RUNTIME_SECONDS,
+            )
+            for line in (done.stdout or "").splitlines():
+                log(line)
+            if done.returncode != 0:
+                said = [line for line in (done.stderr or "").splitlines() if line.strip()]
+                self.fault = "the runtime could not be installed: %s" % (said[-1] if said else "no answer")
+        except subprocess.TimeoutExpired:
+            self.fault = "the runtime was not installed in %d seconds" % RUNTIME_SECONDS
+        except OSError as exc:
+            self.fault = "the runtime could not start installing: %s" % exc
+        if self.fault:
+            log("%s; this machine takes no job" % self.fault)
+
     def check_gpus(self) -> None:
         """Run the GPU check once, before the first job."""
         try:
@@ -1649,7 +1692,9 @@ class Agent:
                 else "s3://%s/%s, staged in %s" % (bucket.bucket, bucket.prefix, self.config.runs),
             )
         )
-        if self.config.check_gpus:
+        if self.config.runtime:
+            self.install_runtime()
+        if self.config.check_gpus and self.fault is None:
             self.check_gpus()
         self.reconcile()
         polled = 0.0

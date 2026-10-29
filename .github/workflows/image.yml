@@ -49,6 +49,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@v3
+      # The wheels the image no longer carries (runtime.py), into the mirror
+      # nodes fetch them from, before the image that names them exists: a
+      # node never starts from an image whose wheels are not there yet. A
+      # wheel's name fixes its bytes, so only the names the mirror lacks go.
+      # Any S3 bucket: SMITH_RUNTIME_ENDPOINT, _BUCKET, _ACCESS_KEY,
+      # _SECRET_KEY. Without them nothing is mirrored, and nodes fetch from
+      # the index the wheels were resolved from.
+      - name: Mirror the runtime's wheels
+        env:
+          ENDPOINT: ${{ secrets.SMITH_RUNTIME_ENDPOINT }}
+          BUCKET: ${{ secrets.SMITH_RUNTIME_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SMITH_RUNTIME_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SMITH_RUNTIME_SECRET_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          if [ -z "$BUCKET" ]; then
+            echo "No SMITH_RUNTIME_BUCKET: nothing mirrored" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          docker buildx build -f Dockerfile.gpu --target bundle --output type=local,dest=bundle .
+          aws s3 sync bundle "s3://$BUCKET/" --endpoint-url "$ENDPOINT" --size-only --no-progress
+          echo "Mirrored $(ls bundle | wc -l) wheels, $(du -sh bundle | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf bundle
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -67,5 +90,31 @@ jobs:
         run: |
           docker manifest inspect "${{ steps.tag.outputs.image }}" > /dev/null
           docker manifest inspect "${{ steps.tag.outputs.latest }}" > /dev/null
+      # No layer over 250 MB, as pulled: a host's docker starts a dropped
+      # layer again from its first byte, so a big one is what a slow host
+      # never finishes (GPU-225). Checked on what was pushed, not on what
+      # the Dockerfile says.
+      - name: Every layer is under 250 MB
+        run: |
+          image="${{ steps.tag.outputs.image }}"
+          digest=$(docker buildx imagetools inspect --raw "$image" | python3 -c '
+          import json, sys
+          index = json.load(sys.stdin)
+          for item in index.get("manifests", []):
+              if item.get("platform", {}).get("architecture") == "amd64":
+                  print(item["digest"]); break
+          else:
+              print("")')
+          ref="$image"; [ -n "$digest" ] && ref="${image%%:*}@$digest"
+          docker buildx imagetools inspect --raw "$ref" | python3 -c '
+          import json, sys
+          layers = json.load(sys.stdin)["layers"]
+          limit = 250 * 1000 * 1000
+          for layer in layers:
+              print("%7.1f MB  %s" % (layer["size"] / 1e6, layer["digest"][:19]))
+          total = sum(layer["size"] for layer in layers)
+          print("%7.1f MB  in all" % (total / 1e6))
+          big = [layer for layer in layers if layer["size"] > limit]
+          sys.exit("%d layer(s) over 250 MB" % len(big) if big else 0)'
       - name: Summary
         run: echo "Pushed \`${{ steps.tag.outputs.image }}\`, now also \`latest\`" >> "$GITHUB_STEP_SUMMARY"

@@ -40,7 +40,20 @@ docker build -t smith --build-arg LIBS=source \
 The GPU image is published by pushing to the `deploy` branch
 (`git push origin main:deploy`): `.github/workflows/image.yml` builds it from
 PyPI and pushes it as `ghcr.io/<owner>/smith-gpu:<commit>`, smith's short
-commit, and as `:latest`, then checks both tags are in the registry.
+commit, and as `:latest`, then checks both tags are in the registry and that
+no layer is over 250 MB.
+
+**The GPU image does not carry torch.** torch with its CUDA libraries is
+about 7 GB, and a host's docker that drops a layer pulls it again from its
+first byte: on slow hosts the image never arrived. So the image carries only
+the lock, `runtime.json` (each wheel's name, address and sha256, resolved
+from `runtime.in` when it is built), and `runtime.py` fetches the wheels when
+the node starts, before the first heartbeat: in pieces, sixteen at once, each
+retried on its own, each file checked against its hash, then installed with
+uv. From `SMITH_RUNTIME_URL` when it is set - a mirror where each wheel is at
+its own file name - and from the index they were resolved from otherwise, or
+for a file the mirror lacks. `image.yml` fills the mirror before it pushes the
+image, when its `SMITH_RUNTIME_*` secrets name an S3 bucket.
 
 ## What it expects of a backend
 
@@ -110,6 +123,11 @@ for as a GPU. If the check fails smith takes no job, and says what is wrong as
 `fault` in every heartbeat, for the backend to give the machine back.
 `check_gpus = false` (or `SMITH_CHECK_GPUS=0`) turns it off; `true` turns it
 on for hardware named otherwise.
+
+**The runtime.** With `runtime = "<manifest>"` in its configuration, as the
+GPU image has, smith installs that manifest's wheels before anything else,
+the GPU check included (see above, and `runtime.py`). One that cannot be
+installed is a `fault` like a GPU that does not work: no job is taken.
 
 
 Apache-2.0 — [GPU Zero](https://gpuzero.dev)
