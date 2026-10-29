@@ -88,7 +88,7 @@ the script with the job's parameters. It runs whatever the repository holds,
 so leave it off on a machine shared with people the repository is not theirs.
 The token reaches git through its environment only, and never the run.
 
-The runs are [Ravex](https://github.com/JHNMACHINE/ravex) scripts: smith hands
+The runs are [Ravex](https://github.com/gpuzero-dev/ravex) scripts: smith hands
 them their store, name and the backend's address through `RAVEX_*` variables,
 and ships what a finished run could not send with `ravex ship`.
 

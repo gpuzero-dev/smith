@@ -42,7 +42,7 @@ RUN pip install "moonclip==${MOONCLIP_VERSION}" "ravex==${RAVEX_VERSION}"
 # The scripts smith.docker.toml offers are Ravex's examples, which the wheel
 # does not carry: taken from the release's tag, so they match the library.
 RUN mkdir -p /app \
-    && curl -fsSL "https://github.com/JHNMACHINE/ravex/archive/refs/tags/v${RAVEX_VERSION}.tar.gz" \
+    && curl -fsSL "https://github.com/gpuzero-dev/ravex/archive/refs/tags/v${RAVEX_VERSION}.tar.gz" \
        | tar -xz -C /tmp \
     && mv "/tmp/ravex-${RAVEX_VERSION}/examples" /app/examples \
     && rm -rf "/tmp/ravex-${RAVEX_VERSION}"

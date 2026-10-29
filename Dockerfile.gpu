@@ -37,7 +37,7 @@ RUN pip download --no-deps --only-binary=:all: -d /wheels \
 # the wheel does not carry: taken from the release's tag, so they match the
 # library. A bench newer than the release is not there, and a job naming it
 # fails at start saying so.
-RUN curl -fsSL "https://github.com/JHNMACHINE/ravex/archive/refs/tags/v${RAVEX_VERSION}.tar.gz" \
+RUN curl -fsSL "https://github.com/gpuzero-dev/ravex/archive/refs/tags/v${RAVEX_VERSION}.tar.gz" \
       | tar -xz -C /tmp \
     && mv "/tmp/ravex-${RAVEX_VERSION}/examples" /examples \
     && mv "/tmp/ravex-${RAVEX_VERSION}/bench" /bench
