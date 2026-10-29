@@ -3,6 +3,7 @@
     python runtime.py lock    --report <pip report> --out <manifest>
     python runtime.py fetch   --manifest <manifest> --dir <directory> [--signed <address>] [--mirror <url>]
     python runtime.py install --manifest <manifest> [--signed <address>] [--mirror <url>] [--python <interpreter>]
+    python runtime.py fill    --manifest <manifest> --builder <address> [--dry-run]
 
 **Why not in the image.** torch with its CUDA libraries is about 7 GB, and in
 the image it was layers of about a gigabyte each. A rented machine pulls the
@@ -31,9 +32,8 @@ next one when a source fails or lacks it:
    there, and the node holds no key to the bucket: it asks the service, with
    the token in ``SMITH_CACHE_TOKEN`` - from the environment, never the
    command line, where any user of the machine can read it - for a URL that
-   reads that one file, the protocol of ``cache.py``'s ``SignedStore``. Who
-   fills the cache is the backend's business: this public repository's CI
-   holds no bucket key.
+   reads that one file, the protocol of ``cache.py``'s ``SignedStore``. It is
+   filled by ``fill``, below.
 2. A mirror, if one is given - ``--mirror`` or ``SMITH_RUNTIME_URL``, a base
    address under which each wheel is at its own file name - for whoever runs
    smith without such a backend and hosts a plain one.
@@ -42,6 +42,22 @@ next one when a source fails or lacks it:
 A wheel's name and content are fixed by whoever published it, so one copy in
 the cache or the mirror serves every image that names it, and filling either
 is uploading the names it lacks.
+
+**Filling the cache** (``fill``). Run by this repository's
+``.github/workflows/cache.yml`` (its ``runtime`` job) as soon as an image
+is published and again every hour, with the manifest taken out of that
+image. It asks the backend's builder service -
+``--builder``, with the builder token in ``SMITH_BUILDER_TOKEN``, never on the
+command line - for the list of ``runtime/`` once, and for each wheel the cache
+lacks fetches it from its index with ``fetch`` (so checked against the
+manifest's sha256 before anything is uploaded), asks for a URL that writes
+that one file with its exact size, uploads it from disk and deletes it. One
+wheel at a time, so the disk holds the largest wheel and never the whole
+set. It lives here, in a public repository whose CI holds no bucket key, for
+the same reason ``builder.py`` does: the service signs each write for the
+builder token alone and decides which paths it allows, so what the CI holds
+is worth one upload at a time, not the bucket. And it needs no trust in what
+it uploaded: every node checks every wheel against the manifest again.
 
 **A signed URL expires** (the service says after how long; minutes), and a
 slow host may still be fetching a gigabyte wheel when it does. So a file's URL
@@ -481,6 +497,193 @@ def _whence(done: Dict[str, Any]) -> str:
         counts["cache"], counts["mirror"], counts["index"])
 
 
+# ─── filling the cache ────────────────────────────────────────────────
+
+#: Tries per upload, each at a URL signed anew: a PUT URL lives minutes, and
+#: one that failed may have failed because it expired.
+UPLOADS = 4
+
+
+class Refused(OSError):
+    """The builder service answered with an error status: ``code`` says
+    which, since a bad token and a backend without a cache end a fill
+    differently."""
+
+    def __init__(self, message: str, code: int) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class Builder:
+    """The backend's signing service for writing the cache's ``runtime/``
+    part, with the builder token: ``list`` once, then one ``put`` per wheel
+    it lacks, each answered with a URL that writes that file alone, at the
+    size it was asked for. No bucket key is ever on the machine that fills.
+
+    Its own few lines rather than ``cache.py``'s ``SignedStore``, like
+    ``Signer``: that one puts bytes held in memory, and a wheel is a
+    gigabyte streamed from disk."""
+
+    def __init__(self, address: str, token: str) -> None:
+        self.address = address
+        self.token = token
+
+    def _ask(self, asked: Dict[str, Any]) -> Dict[str, Any]:
+        request = urllib.request.Request(
+            self.address,
+            data=json.dumps(asked).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.token, "User-Agent": AGENT},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                answer = json.loads(response.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise Refused("the backend refused %s %s: %d" % (asked["op"], asked["path"], exc.code), exc.code) from None
+        except ValueError:
+            raise OSError("the backend answered %s %s with something not JSON" % (asked["op"], asked["path"])) from None
+        if not isinstance(answer, dict):
+            raise OSError("the backend answered %s %s with %r" % (asked["op"], asked["path"], answer))
+        return answer
+
+    def list(self) -> List[str]:
+        """The wheel names the cache already has."""
+        paths = self._ask({"op": "list", "path": CACHE_PREFIX}).get("paths")
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            raise OSError("the backend listed %s as %r" % (CACHE_PREFIX, paths))
+        return sorted(path[len(CACHE_PREFIX):] for path in paths if path.startswith(CACHE_PREFIX))
+
+    def put(self, name: str, size: int) -> str:
+        url = self._ask({"op": "put", "path": CACHE_PREFIX + name, "size": size}).get("url")
+        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+            raise OSError("the backend gave no URL to put %s" % name)
+        return url
+
+
+def _upload(builder: Builder, name: str, local: str) -> None:
+    """``local`` into the cache as ``runtime/<name>``, streamed from disk with
+    its exact length: the URL is signed for that ``Content-Length``, and
+    without one urllib would send a file in chunks, which a presigned PUT
+    does not take. Each try signs a new URL, so one that expired while an
+    earlier try was sending is never asked again."""
+    size = os.path.getsize(local)
+    error = ""
+    for attempt in range(UPLOADS):
+        try:
+            url = builder.put(name, size)
+        except Refused as exc:
+            # A token or a path the backend refuses is refused again on the
+            # next try; only a service that failed is worth asking again.
+            if exc.code in (401, 403):
+                raise
+            error = str(exc)
+        except OSError as exc:
+            error = str(exc)
+        else:
+            try:
+                with open(local, "rb") as body:
+                    request = urllib.request.Request(url, data=body, method="PUT", headers={
+                        "Content-Length": str(size),
+                        # The URL signs the length, not the type; one is still
+                        # sent, or urllib would send a form's.
+                        "Content-Type": "application/octet-stream",
+                        "User-Agent": AGENT,
+                    })
+                    with urllib.request.urlopen(request, timeout=TIMEOUT):
+                        pass
+                return
+            except urllib.error.HTTPError as exc:
+                exc.close()
+                # Never the URL itself, which writes the file until it expires.
+                error = "the bucket answered %d" % exc.code
+            except (OSError, urllib.error.URLError) as exc:
+                error = str(getattr(exc, "reason", exc))
+        time.sleep(min(2 ** attempt, 10))
+    raise OSError("upload failed %d times, last: %s" % (UPLOADS, error))
+
+
+def fill(manifest: Dict[str, Any], builder: Builder, directory: Optional[str] = None,
+         dry_run: bool = False) -> Dict[str, Any]:
+    """Every wheel of ``manifest`` the cache lacks, fetched from its index and
+    uploaded, one at a time. Returns the names ``present``, ``missing``
+    (what a dry run would upload), ``uploaded``, and ``failed`` with why.
+
+    One wheel at a time, so the disk holds the largest of them and not the
+    whole set; each still arrives in parallel pieces through ``fetch``, which
+    checks its sha256 first: bytes that are not the manifest's are never
+    uploaded. A failed wheel does not stop the others, which a node can use
+    meanwhile; the next fill tries it again."""
+    have = set(builder.list())
+    done: Dict[str, Any] = {"present": [], "missing": [], "uploaded": [], "failed": {}}
+    for entry in manifest["files"]:
+        (done["present"] if entry["name"] in have else done["missing"]).append(entry["name"])
+    for name in done["present"]:
+        say("present  %s" % name)
+    if dry_run:
+        for name in done["missing"]:
+            say("missing  %s" % name)
+        return done
+    work = directory or tempfile.mkdtemp(prefix="smith-fill-")
+    os.makedirs(work, exist_ok=True)
+    try:
+        for entry in manifest["files"]:
+            if entry["name"] in have:
+                continue
+            local = os.path.join(work, entry["name"])
+            started = time.monotonic()
+            try:
+                fetch({"version": 1, "files": [entry]}, work)
+                size = os.path.getsize(local)
+                _upload(builder, entry["name"], local)
+            except Refused as exc:
+                if exc.code == 401:
+                    # The token is the whole fill's: every other wheel would be
+                    # refused the same way.
+                    raise
+                done["failed"][entry["name"]] = str(exc)
+                say("failed   %s: %s" % (entry["name"], exc))
+            except (OSError, urllib.error.URLError) as exc:
+                done["failed"][entry["name"]] = str(exc)
+                say("failed   %s: %s" % (entry["name"], exc))
+            else:
+                done["uploaded"].append(entry["name"])
+                say("uploaded %s (%.0f MB in %.1f s)" % (entry["name"], size / 1e6, time.monotonic() - started))
+            finally:
+                if os.path.exists(local):
+                    os.remove(local)
+    finally:
+        if directory is None:
+            shutil.rmtree(work, ignore_errors=True)
+    return done
+
+
+def _fill(manifest_path: str, address: str, dry_run: bool) -> int:
+    """``fill`` from the command line: its exit status, and a summary line."""
+    token = os.environ.get("SMITH_BUILDER_TOKEN")
+    if not token:
+        raise SystemExit("fill needs the builder token in SMITH_BUILDER_TOKEN")
+    manifest = read_manifest(manifest_path)
+    try:
+        done = fill(manifest, Builder(address, token), dry_run=dry_run)
+    except Refused as exc:
+        if exc.code == 503:
+            # A backend may keep no cache, or no builder for it: there is
+            # nothing to fill, which is not this repository's failure.
+            say("the backend keeps no cache to fill (503): nothing done")
+            return 0
+        if exc.code == 401:
+            raise SystemExit("the backend refused the builder token (401)") from None
+        raise SystemExit(str(exc)) from None
+    except OSError as exc:
+        raise SystemExit("the cache could not be listed: %s" % exc) from None
+    if dry_run:
+        say("%d present, %d missing" % (len(done["present"]), len(done["missing"])))
+        return 0
+    say("%d uploaded, %d present, %d failed" % (len(done["uploaded"]), len(done["present"]), len(done["failed"])))
+    return 1 if done["failed"] else 0
+
+
 def _signer(address: Optional[str]) -> Optional[Signer]:
     """The cache's signing service at ``address``, with the token from the
     environment: on the command line any user of the machine could read it."""
@@ -509,7 +712,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         # node uses the backend's cache is smith's decision (SMITH_CACHE).
         one.add_argument("--signed", default=None, help="the signing service of the cache's runtime/ wheels")
         one.add_argument("--mirror", default=os.environ.get("SMITH_RUNTIME_URL") or None)
+    one = sub.add_parser("fill", help="upload to the backend's cache the manifest's wheels it lacks")
+    one.add_argument("--manifest", required=True)
+    # The address only: the token is SMITH_BUILDER_TOKEN, never an argument.
+    one.add_argument("--builder", required=True, help="the backend's signing service for writing runtime/")
+    one.add_argument("--dry-run", action="store_true", help="only say which wheels the cache lacks")
     args = parser.parse_args(argv)
+    if args.command == "fill":
+        return _fill(args.manifest, args.builder, args.dry_run)
     if args.command == "lock":
         manifest = lock(args.report, args.out)
         say("%d wheels locked in %s" % (len(manifest["files"]), args.out))

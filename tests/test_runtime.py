@@ -74,6 +74,35 @@ class _Files(http.server.BaseHTTPRequestHandler):
             return
         self.wfile.write(part)
 
+    #: PUTs answered 403 before one is taken, as a bucket answers a presigned
+    #: PUT that expired while it waited.
+    expire_puts = 0
+    put: list = []
+
+    def do_PUT(self):
+        """A bucket's presigned PUT: the URL says the size it was signed for
+        (``?size=``), and a body without that exact ``Content-Length`` - or
+        sent in chunks, as urllib does a file without one - is refused."""
+        url = urllib.parse.urlsplit(self.path)
+        signed = int(urllib.parse.parse_qs(url.query)["size"][0])
+        length = self.headers.get("Content-Length")
+        if self.headers.get("Transfer-Encoding") or length != str(signed):
+            self.send_error(403, "SignatureDoesNotMatch")
+            return
+        data = self.rfile.read(signed)
+        if type(self).expire_puts:
+            type(self).expire_puts -= 1
+            self.send_error(403, "Request has expired")
+            return
+        assert self.headers.get("Content-Type") == "application/octet-stream"
+        name = urllib.parse.unquote(url.path.lstrip("/").split("/")[-1])
+        with open(os.path.join(self.root, name), "wb") as out:
+            out.write(data)
+        type(self).put.append(name)
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
 
 @pytest.fixture
 def serve(tmp_path, monkeypatch):
@@ -85,7 +114,7 @@ def serve(tmp_path, monkeypatch):
     def start(name, **behaviour):
         root = tmp_path / name
         root.mkdir(exist_ok=True)
-        handler = type("Handler", (_Files,), {"root": str(root), "asked": [], "uses": {}, **behaviour})
+        handler = type("Handler", (_Files,), {"root": str(root), "asked": [], "uses": {}, "put": [], **behaviour})
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
@@ -333,3 +362,168 @@ def test_the_token_comes_from_the_environment_and_never_the_command_line(serve, 
     config.cache_service = False
     command, env = smith.Agent.runtime_command(types.SimpleNamespace(config=config), "runtime.py")
     assert "--signed" not in command
+
+
+# ─── filling the cache ────────────────────────────────────────────────
+
+
+class _Builder(http.server.BaseHTTPRequestHandler):
+    """A backend's builder service: ``list`` answers what the bucket's
+    directory holds under ``runtime/``, ``put`` a URL of the bucket signed
+    for that size; ``refuse`` answers every call with that status."""
+
+    bucket = ""
+    root = ""
+    token = "builder-token"
+    refuse = 0
+    asked: list = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        asked = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.headers.get("Authorization") != "Bearer " + self.token:
+            self.send_error(401)
+            return
+        if self.refuse:
+            self.send_error(self.refuse)
+            return
+        type(self).asked.append((asked["op"], asked["path"]))
+        if asked["op"] == "list":
+            assert asked["path"] == "runtime/"
+            answer = {"paths": sorted("runtime/" + name for name in os.listdir(self.root))}
+        else:
+            assert asked["op"] == "put" and asked["path"].startswith("runtime/")
+            name = asked["path"][len("runtime/"):]
+            answer = {"url": "%s/%s?sig=%d&size=%d" % (self.bucket, urllib.parse.quote(name), len(self.asked),
+                                                       asked["size"]), "expires": 600}
+        body = json.dumps(answer).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def builder():
+    """``builder(bucket, root, **behaviour)``: a builder service for the
+    bucket at ``bucket`` whose files are in ``root``; its address and handler."""
+    servers = []
+
+    def start(bucket, root, **behaviour):
+        handler = type("Builder", (_Builder,), {"bucket": bucket, "root": str(root), "asked": [], **behaviour})
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return "http://127.0.0.1:%d/api/cache-runtime/sign" % server.server_port, handler
+
+    yield start
+    for server in servers:
+        server.shutdown()
+
+
+def _lock(tmp_path, index, entries):
+    for entry in entries:
+        entry["url"] = index + "/" + entry["name"]
+    path = tmp_path / "runtime.json"
+    path.write_text(json.dumps({"version": 1, "files": entries}))
+    return str(path)
+
+
+def test_fill_uploads_what_the_cache_lacks_and_leaves_what_it_has(serve, builder, tmp_path):
+    index, index_root, index_handler = serve("index")
+    bucket, bucket_root, bucket_handler = serve("bucket")
+    present = _wheel(index_root, "present-1.0-py3-none-any.whl", 300)
+    (bucket_root / present["name"]).write_bytes((index_root / present["name"]).read_bytes())
+    big = _wheel(index_root, "torch-2.11.0+cu128-cp312-linux_x86_64.whl", 5500)
+    small = _wheel(index_root, "small-1.0-py3-none-any.whl", 10)
+    manifest = json.loads(open(_lock(tmp_path, index, [present, big, small])).read())
+    address, service = builder(bucket, bucket_root)
+    work = tmp_path / "work"
+    done = runtime.fill(manifest, runtime.Builder(address, "builder-token"), directory=str(work))
+    assert done["present"] == [present["name"]]
+    assert sorted(done["uploaded"]) == sorted([big["name"], small["name"]]) and not done["failed"]
+    for entry in (present, big, small):
+        assert (bucket_root / entry["name"]).read_bytes() == (index_root / entry["name"]).read_bytes()
+    # Listed once, a put signed per missing wheel, the present one never
+    # fetched or put; nothing is left on disk.
+    assert service.asked == [("list", "runtime/"), ("put", "runtime/" + big["name"]), ("put", "runtime/" + small["name"])]
+    assert not any(path.endswith(present["name"]) for path in index_handler.asked)
+    assert sorted(bucket_handler.put) == sorted([big["name"], small["name"]])
+    assert os.listdir(work) == []
+
+
+def test_fill_never_uploads_bytes_that_are_not_the_manifests(serve, builder, tmp_path, monkeypatch):
+    index, index_root, _ = serve("index")
+    bucket, bucket_root, bucket_handler = serve("bucket")
+    bad = _wheel(index_root, "torch-2.11.0-cp312-linux_x86_64.whl", 1500)
+    bad["sha256"] = "0" * 64
+    good = _wheel(index_root, "good-1.0-py3-none-any.whl", 100)
+    manifest = _lock(tmp_path, index, [bad, good])
+    address, service = builder(bucket, bucket_root)
+    monkeypatch.setenv("SMITH_BUILDER_TOKEN", "builder-token")
+    assert runtime.main(["fill", "--manifest", manifest, "--builder", address]) == 1
+    # The other wheel still went up; the poisoned one was never even signed.
+    assert bucket_handler.put == [good["name"]]
+    assert ("put", "runtime/" + bad["name"]) not in service.asked
+    assert not (bucket_root / bad["name"]).exists()
+
+
+def test_an_expired_put_is_signed_again(serve, builder, tmp_path):
+    index, index_root, _ = serve("index")
+    bucket, bucket_root, bucket_handler = serve("bucket", expire_puts=1)
+    entry = _wheel(index_root, "torch-2.11.0-cp312-linux_x86_64.whl", 2500)
+    manifest = json.loads(open(_lock(tmp_path, index, [entry])).read())
+    address, service = builder(bucket, bucket_root)
+    done = runtime.fill(manifest, runtime.Builder(address, "builder-token"))
+    assert done["uploaded"] == [entry["name"]]
+    assert (bucket_root / entry["name"]).read_bytes() == (index_root / entry["name"]).read_bytes()
+    assert service.asked.count(("put", "runtime/" + entry["name"])) == 2
+
+
+def test_a_dry_run_says_what_is_missing_and_uploads_nothing(serve, builder, tmp_path, monkeypatch, capsys):
+    index, index_root, index_handler = serve("index")
+    bucket, bucket_root, bucket_handler = serve("bucket")
+    entry = _wheel(index_root, "new-1.0-py3-none-any.whl", 100)
+    manifest = _lock(tmp_path, index, [entry])
+    address, service = builder(bucket, bucket_root)
+    monkeypatch.setenv("SMITH_BUILDER_TOKEN", "builder-token")
+    assert runtime.main(["fill", "--manifest", manifest, "--builder", address, "--dry-run"]) == 0
+    assert "missing  " + entry["name"] in capsys.readouterr().out
+    assert service.asked == [("list", "runtime/")]
+    assert index_handler.asked == [] and bucket_handler.put == []
+
+
+def test_the_builder_token_comes_from_the_environment_and_never_the_command_line(serve, builder, tmp_path, monkeypatch):
+    index, index_root, _ = serve("index")
+    bucket, bucket_root, bucket_handler = serve("bucket")
+    entry = _wheel(index_root, "small-1.0-py3-none-any.whl", 10)
+    manifest = _lock(tmp_path, index, [entry])
+    address, _ = builder(bucket, bucket_root)
+    arguments = ["fill", "--manifest", manifest, "--builder", address]
+    monkeypatch.delenv("SMITH_BUILDER_TOKEN", raising=False)
+    with pytest.raises(SystemExit, match="SMITH_BUILDER_TOKEN"):
+        runtime.main(arguments)
+    # There is no argument to pass it as.
+    with pytest.raises(SystemExit):
+        runtime.main(arguments + ["--token", "builder-token"])
+    monkeypatch.setenv("SMITH_BUILDER_TOKEN", "wrong")
+    with pytest.raises(SystemExit, match="401"):
+        runtime.main(arguments)
+    monkeypatch.setenv("SMITH_BUILDER_TOKEN", "builder-token")
+    assert runtime.main(arguments) == 0
+    assert bucket_handler.put == [entry["name"]]
+
+
+def test_a_backend_without_a_cache_is_nothing_to_fill(serve, builder, tmp_path, monkeypatch, capsys):
+    index, index_root, index_handler = serve("index")
+    bucket, bucket_root, _ = serve("bucket")
+    entry = _wheel(index_root, "small-1.0-py3-none-any.whl", 10)
+    manifest = _lock(tmp_path, index, [entry])
+    address, _ = builder(bucket, bucket_root, refuse=503)
+    monkeypatch.setenv("SMITH_BUILDER_TOKEN", "builder-token")
+    assert runtime.main(["fill", "--manifest", manifest, "--builder", address]) == 0
+    assert "keeps no cache" in capsys.readouterr().out
+    assert index_handler.asked == []

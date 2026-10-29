@@ -55,8 +55,22 @@ when the node uses it (`SMITH_CACHE=backend`), at `runtime/<wheel file name>`
 in its read-only `global` scope, through a URL the backend signs for each file
 (the protocol of `cache.py`, below) and signs again when it expires mid-download;
 else a mirror if `SMITH_RUNTIME_URL` is set, where each wheel is at its own
-file name; else the index the wheel was resolved from. Filling the cache is the
-backend's side: this repository's CI holds no bucket key.
+file name; else the index the wheel was resolved from.
+
+**Who fills the cache's `runtime/`.** This repository's
+`.github/workflows/cache.yml`, its `runtime` job: as soon as `image.yml` has
+published an image, then every hour for `:latest` (or by hand, for any
+tag): it takes `runtime.json` out of that image and runs `runtime.py fill`,
+which fetches each wheel the cache lacks from its index, checks its sha256
+and uploads it, one at a time. Like the wheel builder, the same workflow's
+`wheels` job, it holds no bucket key, only the secrets `SMITH_BACKEND` and
+`SMITH_BUILDER_TOKEN`; without them it fills nothing. It asks the backend,
+with `Authorization: Bearer <SMITH_BUILDER_TOKEN>`, at
+`POST /api/cache-runtime/sign`:
+`{"op": "list", "path": "runtime/"}` → `{"paths": ["runtime/<wheel>", ...]}`
+once, then `{"op": "put", "path": "runtime/<wheel>", "size": <bytes>}` →
+`{"url": "<presigned PUT for that Content-Length>"}` for each wheel it
+uploads. A 503 means the backend keeps no cache, and there is nothing to fill.
 
 ## What it expects of a backend
 

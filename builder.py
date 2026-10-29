@@ -3,8 +3,8 @@
     python builder.py            # one build from the backend's queue, if there is one
     python builder.py --pending  # only says whether there is one, without taking it
 
-Run by ``.github/workflows/wheels.yml`` inside the GPU image, which is what the
-nodes run: the wheel is built against the image's Python and torch, and those
+Run by ``.github/workflows/cache.yml`` (its ``wheels`` job) inside the GPU
+image, which is what the nodes run: the wheel is built against the image's Python and torch, and those
 are part of the key a node looks it up by.
 
 **Why a builder and not the nodes.** smith reports, after installing a job's

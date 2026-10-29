@@ -77,7 +77,9 @@ FROM wheels-${LIBS} AS wheels
 # name, address and sha256 - and smith fetches the wheels when the node starts,
 # in pieces, several at once: from the backend's cache when the node uses it
 # (SMITH_CACHE=backend), else from a mirror if SMITH_RUNTIME_URL is set, else
-# from the index they were resolved from.
+# from the index they were resolved from. The cache's copies are uploaded by
+# .github/workflows/cache.yml, from this lock, as soon as the image is
+# published and again every hour.
 #
 # Resolved here from runtime.in, with both indexes: torch is pinned with its
 # local version, which only the cu128 index has, so PyPI cannot offer a newer
