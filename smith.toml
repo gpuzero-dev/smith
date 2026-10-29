@@ -1,6 +1,8 @@
 # smith on this machine: what it may run, and where the runs go.
 #
-#   ../ravex/.venv/Scripts/python smith.py
+#   ../ravex/.venv/bin/python smith.py
+#
+# (on Windows, ..\ravex\.venv\Scripts\python.exe smith.py)
 #
 # Paths are relative to this file; the ones below assume a ravex checkout
 # beside smith's. A job names one of the scripts below by its key and nothing
@@ -12,7 +14,7 @@ hardware = "local-cpu"
 runs = "runs"
 # The interpreter for the scripts. Default: the one running smith, which is
 # why it is started from the training environment's venv.
-# python = "../ravex/.venv/Scripts/python.exe"
+# python = "../ravex/.venv/bin/python"
 
 [scripts]
 # `model`: the parameters that change the model itself. A run cannot carry on
