@@ -1,8 +1,8 @@
 """runtime: the heavy part of a GPU node's Python, downloaded when the node starts instead of carried in its image.
 
     python runtime.py lock    --report <pip report> --out <manifest>
-    python runtime.py fetch   --manifest <manifest> --dir <directory> [--mirror <url>]
-    python runtime.py install --manifest <manifest> [--mirror <url>] [--python <interpreter>]
+    python runtime.py fetch   --manifest <manifest> --dir <directory> [--signed <address>] [--mirror <url>]
+    python runtime.py install --manifest <manifest> [--signed <address>] [--mirror <url>] [--python <interpreter>]
 
 **Why not in the image.** torch with its CUDA libraries is about 7 GB, and in
 the image it was layers of about a gigabyte each. A rented machine pulls the
@@ -22,13 +22,33 @@ the size is asked of the source. The image decides exactly what is installed; a 
 where to fetch it from. A wheel whose bytes do not hash to the manifest's is
 refused, whatever served it.
 
-**Where from.** A mirror if one is given - ``--mirror`` or
-``SMITH_RUNTIME_URL``, a base address under which each wheel is at its own
-file name: a public bucket close to every provider - and otherwise, or for a
-file the mirror does not have, the address the manifest resolved it from.
+**Where from.** Each file from the first of these that has it, and from the
+next one when a source fails or lacks it:
+
+1. The backend's cache, when the node uses it (``SMITH_CACHE=backend``, and
+   smith passes ``--signed <address>``, the signing service of the cache's
+   read-only ``global`` scope). Each wheel is at ``runtime/<file name>``
+   there, and the node holds no key to the bucket: it asks the service, with
+   the token in ``SMITH_CACHE_TOKEN`` - from the environment, never the
+   command line, where any user of the machine can read it - for a URL that
+   reads that one file, the protocol of ``cache.py``'s ``SignedStore``. Who
+   fills the cache is the backend's business: this public repository's CI
+   holds no bucket key.
+2. A mirror, if one is given - ``--mirror`` or ``SMITH_RUNTIME_URL``, a base
+   address under which each wheel is at its own file name - for whoever runs
+   smith without such a backend and hosts a plain one.
+3. The address the manifest resolved it from.
+
 A wheel's name and content are fixed by whoever published it, so one copy in
-the mirror serves every image that names it, and filling the mirror is
-uploading the names it lacks.
+the cache or the mirror serves every image that names it, and filling either
+is uploading the names it lacks.
+
+**A signed URL expires** (the service says after how long; minutes), and a
+slow host may still be fetching a gigabyte wheel when it does. So a file's URL
+is signed when the file is first asked for, not all of them up front, and a
+piece the bucket refuses with 403 - or 400, which some stores answer for an
+expired signature - has its file's URL signed again and is asked again, a
+bounded number of times (``RESIGNS``), instead of failing the file.
 
 **How.** Every file is split into pieces of ``PIECE`` bytes, and ``TRANSFERS``
 pieces of all the files are fetched at once, each with an HTTP range request,
@@ -51,6 +71,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -68,10 +89,19 @@ TRANSFERS = 16
 #: Tries per piece before its source is given up for that file.
 TRIES = 5
 
+#: Times a file's signed URL is signed again after the bucket refused it as
+#: expired. Two or three cover the slowest host that is worth keeping; the
+#: bound is for a service whose URLs the bucket always refuses, which would
+#: otherwise be signed again for ever.
+RESIGNS = 5
+
 TIMEOUT = 60
 
 #: Some CDNs refuse urllib's own User-Agent.
 AGENT = "smith-runtime/1"
+
+#: Where each wheel is in the backend's cache, by its file name.
+CACHE_PREFIX = "runtime/"
 
 
 def say(message: str) -> None:
@@ -129,33 +159,138 @@ class Unranged(Exception):
     """The source answered a range request with the whole file."""
 
 
-def _open(url: str, first: Optional[int] = None, last: Optional[int] = None):
-    request = urllib.request.Request(url, headers={"User-Agent": AGENT})
-    if first is not None:
-        request.add_header("Range", "bytes=%d-%d" % (first, last))
-    return urllib.request.urlopen(request, timeout=TIMEOUT)
+class Signer:
+    """The backend's signing service for its cache (``cache.py``'s
+    ``SignedStore`` speaks the same protocol): one ``POST`` per file, which
+    answers a URL that reads it straight from the bucket. Only ``get`` is
+    ever asked: a node reads the runtime and never writes it.
+
+    Its own few lines rather than an import of ``cache.py``: the image's
+    build runs this file alone, before anything beside it is copied."""
+
+    def __init__(self, address: str, token: str) -> None:
+        self.address = address
+        self.token = token
+
+    def sign(self, path: str) -> str:
+        request = urllib.request.Request(
+            self.address,
+            data=json.dumps({"op": "get", "path": path}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.token, "User-Agent": AGENT},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                answer = json.loads(response.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            # A service without the file, or without a cache at all, is a
+            # source that lacks it: the next one is asked, as for a mirror.
+            raise OSError("the cache refused to sign %s: %d" % (path, exc.code)) from None
+        except ValueError:
+            raise OSError("the cache answered %s with something not JSON" % path) from None
+        url = answer.get("url") if isinstance(answer, dict) else None
+        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+            raise OSError("the cache gave no URL for %s" % path)
+        return url
 
 
-def _size(url: str) -> int:
+class Plain:
+    """A source at a fixed address: a mirror, or the index."""
+
+    def __init__(self, address: str, kind: str) -> None:
+        self.address = address
+        self.kind = kind
+
+    def url(self) -> str:
+        return self.address
+
+    def renew(self, stale: str, error: urllib.error.HTTPError) -> bool:
+        return False
+
+    def __str__(self) -> str:
+        return self.address
+
+
+class Signed:
+    """A file in the backend's cache, at a URL signed when it is first asked
+    for and signed again when the bucket says it expired. Shared by all the
+    pieces of its file, which run in different threads: the first piece to
+    find the URL expired signs it again, and the others, refused with the
+    same stale URL, take the new one instead of each signing their own."""
+
+    kind = "cache"
+
+    def __init__(self, signer: Signer, path: str) -> None:
+        self.signer = signer
+        self.path = path
+        self._url: Optional[str] = None
+        self._renewals = 0
+        self._lock = threading.Lock()
+
+    def url(self) -> str:
+        with self._lock:
+            if self._url is None:
+                self._url = self.signer.sign(self.path)
+            return self._url
+
+    def renew(self, stale: str, error: urllib.error.HTTPError) -> bool:
+        """Whether to ask again, at a URL signed anew: for a refusal that
+        an expired signature gives, while this file has renewals left."""
+        if error.code not in (400, 403):
+            return False
+        with self._lock:
+            if self._url != stale:
+                return True
+            if self._renewals >= RESIGNS:
+                return False
+            self._renewals += 1
+            self._url = self.signer.sign(self.path)
+            return True
+
+    def __str__(self) -> str:
+        # Never the signed URL itself, which reads the file until it expires.
+        return "the cache's " + self.path
+
+
+Source = Any  # Plain or Signed
+
+
+def _open(source: Source, first: Optional[int] = None, last: Optional[int] = None):
+    """The answer of ``source`` for a range, or the whole file; a signed URL
+    the bucket refused is signed again here, so no caller has to know."""
+    while True:
+        url = source.url()
+        request = urllib.request.Request(url, headers={"User-Agent": AGENT})
+        if first is not None:
+            request.add_header("Range", "bytes=%d-%d" % (first, last))
+        try:
+            return urllib.request.urlopen(request, timeout=TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if not source.renew(url, exc):
+                raise
+
+
+def _size(source: Source) -> int:
     """The file's size, from the first byte's range answer: ``Content-Range``
     says the whole size, and a HEAD is one more thing a CDN may refuse."""
-    with _open(url, 0, 0) as response:
+    with _open(source, 0, 0) as response:
         if response.status != 206:
-            raise Unranged(url)
+            raise Unranged(str(source))
         total = response.headers.get("Content-Range", "").rpartition("/")[2]
         if not total.isdigit():
-            raise Unranged(url)
+            raise Unranged(str(source))
         return int(total)
 
 
-def _piece(url: str, path: str, first: int, last: int) -> None:
-    """Bytes ``first`` to ``last`` of ``url`` into ``path``, at their place."""
+def _piece(source: Source, path: str, first: int, last: int) -> None:
+    """Bytes ``first`` to ``last`` of ``source`` into ``path``, at their place."""
     error: Optional[BaseException] = None
     for attempt in range(TRIES):
         try:
-            with _open(url, first, last) as response:
+            with _open(source, first, last) as response:
                 if response.status != 206:
-                    raise Unranged(url)
+                    raise Unranged(str(source))
                 with open(path, "r+b") as out:
                     out.seek(first)
                     remaining = last - first + 1
@@ -171,21 +306,21 @@ def _piece(url: str, path: str, first: int, last: int) -> None:
         except (OSError, urllib.error.URLError) as exc:
             error = exc
             time.sleep(min(2 ** attempt, 10))
-    raise OSError("bytes %d-%d of %s: %s" % (first, last, url, error))
+    raise OSError("bytes %d-%d of %s: %s" % (first, last, source, error))
 
 
-def _whole(url: str, path: str) -> None:
+def _whole(source: Source, path: str) -> None:
     """A source without ranges: the file in one request, retried whole."""
     error: Optional[BaseException] = None
     for attempt in range(TRIES):
         try:
-            with _open(url) as response, open(path, "wb") as out:
+            with _open(source) as response, open(path, "wb") as out:
                 shutil.copyfileobj(response, out, 1024 * 1024)
             return
         except (OSError, urllib.error.URLError) as exc:
             error = exc
             time.sleep(min(2 ** attempt, 10))
-    raise OSError("%s: %s" % (url, error))
+    raise OSError("%s: %s" % (source, error))
 
 
 def _hash(path: str) -> str:
@@ -196,18 +331,24 @@ def _hash(path: str) -> str:
     return digest.hexdigest()
 
 
-def _sources(entry: Dict[str, Any], mirror: Optional[str]) -> List[str]:
-    sources = []
+def _sources(entry: Dict[str, Any], mirror: Optional[str], signer: Optional[Signer]) -> List[Source]:
+    sources: List[Source] = []
+    if signer is not None:
+        sources.append(Signed(signer, CACHE_PREFIX + entry["name"]))
     if mirror:
-        sources.append(mirror.rstrip("/") + "/" + urllib.parse.quote(entry["name"]))
-    sources.append(entry["url"])
+        sources.append(Plain(mirror.rstrip("/") + "/" + urllib.parse.quote(entry["name"]), "mirror"))
+    sources.append(Plain(entry["url"], "index"))
     return sources
 
 
-def fetch(manifest: Dict[str, Any], directory: str, mirror: Optional[str] = None) -> Dict[str, Any]:
+def fetch(
+    manifest: Dict[str, Any], directory: str, mirror: Optional[str] = None, signer: Optional[Signer] = None
+) -> Dict[str, Any]:
     """Every file of the manifest into ``directory``, each checked against
     its sha256. A file already there with the right hash is kept. Returns
-    what it did, for the log: bytes, seconds, and which files came from where."""
+    what it did, for the log: bytes, seconds, and which files came from
+    where - ``from`` the source of each, ``kinds`` whether that was the
+    cache, the mirror or the index."""
     os.makedirs(directory, exist_ok=True)
     started = time.monotonic()
     wanted = []
@@ -218,13 +359,16 @@ def fetch(manifest: Dict[str, Any], directory: str, mirror: Optional[str] = None
         wanted.append(entry)
     fetched = 0
     origin: Dict[str, str] = {}
+    kinds: Dict[str, str] = {}
 
     # One pool for everything: the pieces of every file go into it together,
     # so a 1 GB wheel and forty small ones fill the same TRANSFERS
     # connections, never more. A file whose source failed - or served bytes
     # that do not hash to the manifest's - goes round again from its next
     # source.
-    pending = [(entry, _sources(entry, mirror)) for entry in wanted]
+    # A cache's URL is signed in _plan, so only for a file still wanted and
+    # only when it is about to be fetched.
+    pending = [(entry, _sources(entry, mirror, signer)) for entry in wanted]
     with ThreadPoolExecutor(max_workers=TRANSFERS, thread_name_prefix="smith-runtime") as pool:
         while pending:
             plans = list(zip(pending, pool.map(lambda item: _plan(item[1][0]), pending)))
@@ -253,7 +397,8 @@ def fetch(manifest: Dict[str, Any], directory: str, mirror: Optional[str] = None
                     if _hash(path) != entry["sha256"]:
                         raise OSError("its sha256 is not the manifest's")
                     fetched += os.path.getsize(path)
-                    origin[entry["name"]] = sources[0]
+                    origin[entry["name"]] = str(sources[0])
+                    kinds[entry["name"]] = sources[0].kind
                 except (OSError, urllib.error.URLError, Unranged) as exc:
                     if os.path.exists(path):
                         os.remove(path)
@@ -264,14 +409,15 @@ def fetch(manifest: Dict[str, Any], directory: str, mirror: Optional[str] = None
                         raise OSError("%s could not be fetched: %s" % (entry["name"], exc)) from None
             pending = again
     seconds = max(time.monotonic() - started, 1e-6)
-    return {"files": len(wanted), "bytes": fetched, "seconds": seconds, "from": origin}
+    return {"files": len(wanted), "bytes": fetched, "seconds": seconds, "from": origin, "kinds": kinds}
 
 
-def _plan(url: str) -> Any:
+def _plan(source: Source) -> Any:
     """How a source serves a file: its size when it takes ranges, None when
-    it only sends it whole, or the error that says it cannot serve it."""
+    it only sends it whole, or the error that says it cannot serve it - a
+    cache that would not sign it among them."""
     try:
-        return _size(url)
+        return _size(source)
     except Unranged:
         return None
     except (OSError, urllib.error.URLError) as exc:
@@ -291,7 +437,9 @@ def _marker(python: str) -> str:
     return os.path.join(purelib, ".smith-runtime")
 
 
-def install(manifest_path: str, mirror: Optional[str] = None, python: Optional[str] = None) -> bool:
+def install(
+    manifest_path: str, mirror: Optional[str] = None, python: Optional[str] = None, signer: Optional[Signer] = None
+) -> bool:
     """Fetch and install the manifest's set for ``python``, unless it is
     already there. Returns whether anything was installed."""
     manifest = read_manifest(manifest_path)
@@ -303,11 +451,10 @@ def install(manifest_path: str, mirror: Optional[str] = None, python: Optional[s
         return False
     directory = tempfile.mkdtemp(prefix="smith-runtime-")
     try:
-        done = fetch(manifest, directory, mirror)
+        done = fetch(manifest, directory, mirror, signer)
         megabytes = done["bytes"] / 1e6
-        mirrored = sum(1 for url in done["from"].values() if mirror and url.startswith(mirror.rstrip("/")))
-        say("fetched %d files, %.0f MB in %.1f s (%.0f MB/s), %d from the mirror" % (
-            done["files"], megabytes, done["seconds"], megabytes / done["seconds"], mirrored))
+        say("fetched %d files, %.0f MB in %.1f s (%.0f MB/s): %s" % (
+            done["files"], megabytes, done["seconds"], megabytes / done["seconds"], _whence(done)))
         paths = [os.path.join(directory, entry["name"]) for entry in manifest["files"]]
         started = time.monotonic()
         uv = shutil.which("uv")
@@ -324,29 +471,54 @@ def install(manifest_path: str, mirror: Optional[str] = None, python: Optional[s
     return True
 
 
+def _whence(done: Dict[str, Any]) -> str:
+    """How many files each kind of source gave, for the log: a cache that
+    gave nothing is the first thing to see when a node fetched slowly."""
+    counts = {kind: 0 for kind in ("cache", "mirror", "index")}
+    for kind in done["kinds"].values():
+        counts[kind] += 1
+    return "%d from the cache, %d from the mirror, %d from the index" % (
+        counts["cache"], counts["mirror"], counts["index"])
+
+
+def _signer(address: Optional[str]) -> Optional[Signer]:
+    """The cache's signing service at ``address``, with the token from the
+    environment: on the command line any user of the machine could read it."""
+    if not address:
+        return None
+    token = os.environ.get("SMITH_CACHE_TOKEN")
+    if not token:
+        raise SystemExit("--signed needs the service's token in SMITH_CACHE_TOKEN")
+    return Signer(address, token)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="The heavy part of a GPU node's Python, fetched at start.")
     sub = parser.add_subparsers(dest="command", required=True)
     one = sub.add_parser("lock", help="a manifest from a pip installation report")
     one.add_argument("--report", required=True)
     one.add_argument("--out", required=True)
-    one = sub.add_parser("fetch", help="the manifest's files into a directory")
-    one.add_argument("--manifest", required=True)
-    one.add_argument("--dir", required=True)
-    one.add_argument("--mirror", default=os.environ.get("SMITH_RUNTIME_URL") or None)
-    one = sub.add_parser("install", help="fetch and install the manifest's set")
-    one.add_argument("--manifest", required=True)
-    one.add_argument("--mirror", default=os.environ.get("SMITH_RUNTIME_URL") or None)
-    one.add_argument("--python", default=None)
+    for name, text in (("fetch", "the manifest's files into a directory"), ("install", "fetch and install the manifest's set")):
+        one = sub.add_parser(name, help=text)
+        one.add_argument("--manifest", required=True)
+        if name == "fetch":
+            one.add_argument("--dir", required=True)
+        else:
+            one.add_argument("--python", default=None)
+        # Only when asked for, never from the environment alone: whether a
+        # node uses the backend's cache is smith's decision (SMITH_CACHE).
+        one.add_argument("--signed", default=None, help="the signing service of the cache's runtime/ wheels")
+        one.add_argument("--mirror", default=os.environ.get("SMITH_RUNTIME_URL") or None)
     args = parser.parse_args(argv)
     if args.command == "lock":
         manifest = lock(args.report, args.out)
         say("%d wheels locked in %s" % (len(manifest["files"]), args.out))
     elif args.command == "fetch":
-        done = fetch(read_manifest(args.manifest), args.dir, args.mirror)
-        say("fetched %d files, %.0f MB in %.1f s" % (done["files"], done["bytes"] / 1e6, done["seconds"]))
+        done = fetch(read_manifest(args.manifest), args.dir, args.mirror, _signer(args.signed))
+        say("fetched %d files, %.0f MB in %.1f s: %s" % (
+            done["files"], done["bytes"] / 1e6, done["seconds"], _whence(done)))
     else:
-        install(args.manifest, args.mirror, args.python)
+        install(args.manifest, args.mirror, args.python, _signer(args.signed))
     return 0
 
 

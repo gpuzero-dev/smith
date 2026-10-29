@@ -75,15 +75,17 @@ FROM wheels-${LIBS} AS wheels
 # it, a layer dropping halfway and starting again from nothing, and never
 # started. So the image carries only the lock, runtime.json - each wheel's
 # name, address and sha256 - and smith fetches the wheels when the node starts,
-# in pieces, several at once, from a mirror close to every provider
-# (SMITH_RUNTIME_URL) or from the index they were resolved from.
+# in pieces, several at once: from the backend's cache when the node uses it
+# (SMITH_CACHE=backend), else from a mirror if SMITH_RUNTIME_URL is set, else
+# from the index they were resolved from.
 #
 # Resolved here from runtime.in, with both indexes: torch is pinned with its
 # local version, which only the cu128 index has, so PyPI cannot offer a newer
 # one; everything else is pinned by torch or free to be the newest of either.
 # Then fetched and installed once in this stage, which the image does not
 # keep, so a lock that cannot be installed fails the build and not a node.
-# The `bundle` target below is these wheels alone, for the mirror.
+# The `bundle` target below is these wheels alone, for whoever fills a cache
+# or a mirror with them.
 FROM python:3.12-slim-bookworm AS runtime
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
@@ -101,7 +103,7 @@ RUN pip install --no-deps --no-index /runtime/wheels/*.whl \
     && python -c "import torch; assert torch.__version__ == '2.11.0+cu128', torch.__version__"
 
 # docker build --target bundle --output type=local,dest=<dir>: the wheels,
-# named as the mirror serves them.
+# named as a cache (under runtime/) or a mirror serves them.
 FROM scratch AS bundle
 COPY --from=runtime /runtime/wheels/ /
 

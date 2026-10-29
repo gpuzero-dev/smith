@@ -49,29 +49,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@v3
-      # The wheels the image no longer carries (runtime.py), into the mirror
-      # nodes fetch them from, before the image that names them exists: a
-      # node never starts from an image whose wheels are not there yet. A
-      # wheel's name fixes its bytes, so only the names the mirror lacks go.
-      # Any S3 bucket: SMITH_RUNTIME_ENDPOINT, _BUCKET, _ACCESS_KEY,
-      # _SECRET_KEY. Without them nothing is mirrored, and nodes fetch from
-      # the index the wheels were resolved from.
-      - name: Mirror the runtime's wheels
-        env:
-          ENDPOINT: ${{ secrets.SMITH_RUNTIME_ENDPOINT }}
-          BUCKET: ${{ secrets.SMITH_RUNTIME_BUCKET }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.SMITH_RUNTIME_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.SMITH_RUNTIME_SECRET_KEY }}
-          AWS_DEFAULT_REGION: auto
-        run: |
-          if [ -z "$BUCKET" ]; then
-            echo "No SMITH_RUNTIME_BUCKET: nothing mirrored" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          docker buildx build -f Dockerfile.gpu --target bundle --output type=local,dest=bundle .
-          aws s3 sync bundle "s3://$BUCKET/" --endpoint-url "$ENDPOINT" --size-only --no-progress
-          echo "Mirrored $(ls bundle | wc -l) wheels, $(du -sh bundle | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
-          rm -rf bundle
       - uses: docker/build-push-action@v6
         with:
           context: .

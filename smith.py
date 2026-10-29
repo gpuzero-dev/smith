@@ -157,7 +157,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 #: Seconds between two polls of the queue, and between two heartbeats.
 POLL_SECONDS = 2.0
@@ -1437,10 +1437,11 @@ class Agent:
         backend gives its job to another instead of waiting on this one."""
         runtime = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime.py")
         log("installing the runtime from %s" % self.config.runtime)
+        command, env = self.runtime_command(runtime)
         try:
             done = subprocess.run(
-                [self.config.python, runtime, "install", "--manifest", self.config.runtime,
-                 "--python", self.config.python],
+                command,
+                env=env,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
@@ -1457,6 +1458,23 @@ class Agent:
             self.fault = "the runtime could not start installing: %s" % exc
         if self.fault:
             log("%s; this machine takes no job" % self.fault)
+
+    def runtime_command(self, runtime: str) -> Tuple[List[str], Dict[str, str]]:
+        """The command that installs the runtime, and its environment.
+
+        With the backend's cache (``SMITH_CACHE=backend``) the wheels come
+        from its read-only ``global`` scope first, through URLs it signs for
+        this agent's token, as a job's compiled dependencies do. The token
+        goes in the environment, as ``SMITH_CACHE_TOKEN`` like ``cache.py``'s,
+        and never on the command line, which any user of the machine can
+        read."""
+        command = [self.config.python, runtime, "install", "--manifest", self.config.runtime,
+                   "--python", self.config.python]
+        env = dict(os.environ)
+        if self.config.cache_service and self.config.token:
+            command += ["--signed", "%s/api/cache/global" % self.config.backend]
+            env["SMITH_CACHE_TOKEN"] = self.config.token
+        return command, env
 
     def check_gpus(self) -> None:
         """Run the GPU check once, before the first job."""

@@ -50,10 +50,13 @@ the lock, `runtime.json` (each wheel's name, address and sha256, resolved
 from `runtime.in` when it is built), and `runtime.py` fetches the wheels when
 the node starts, before the first heartbeat: in pieces, sixteen at once, each
 retried on its own, each file checked against its hash, then installed with
-uv. From `SMITH_RUNTIME_URL` when it is set - a mirror where each wheel is at
-its own file name - and from the index they were resolved from otherwise, or
-for a file the mirror lacks. `image.yml` fills the mirror before it pushes the
-image, when its `SMITH_RUNTIME_*` secrets name an S3 bucket.
+uv. Each file comes from the first source that has it: the backend's cache
+when the node uses it (`SMITH_CACHE=backend`), at `runtime/<wheel file name>`
+in its read-only `global` scope, through a URL the backend signs for each file
+(the protocol of `cache.py`, below) and signs again when it expires mid-download;
+else a mirror if `SMITH_RUNTIME_URL` is set, where each wheel is at its own
+file name; else the index the wheel was resolved from. Filling the cache is the
+backend's side: this repository's CI holds no bucket key.
 
 ## What it expects of a backend
 
@@ -126,8 +129,12 @@ on for hardware named otherwise.
 
 **The runtime.** With `runtime = "<manifest>"` in its configuration, as the
 GPU image has, smith installs that manifest's wheels before anything else,
-the GPU check included (see above, and `runtime.py`). One that cannot be
-installed is a `fault` like a GPU that does not work: no job is taken.
+the GPU check included (see above, and `runtime.py`). With the backend's
+cache, the node first asks `POST /api/cache/global` with its token and
+`{"op": "get", "path": "runtime/<wheel file name>"}` for each wheel, and
+expects `{"url": "<presigned GET that takes Range requests>"}`; a URL that
+answers 404, or a refusal to sign, sends the node to the next source. One that
+cannot be installed is a `fault` like a GPU that does not work: no job is taken.
 
 
 Apache-2.0 — [GPU Zero](https://gpuzero.dev)

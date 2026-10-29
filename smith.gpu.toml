@@ -12,8 +12,9 @@ hardware = "gpu"
 # Staging for the stores, which live in the bucket; and _logs/.
 runs = "/runs"
 # torch and its CUDA libraries, which the image does not carry: fetched and
-# installed by runtime.py before the first job, from SMITH_RUNTIME_URL when
-# it is set and from the index they were resolved from otherwise.
+# installed by runtime.py before the first job: from the backend's cache when
+# the node uses it (SMITH_CACHE=backend), else from a mirror if
+# SMITH_RUNTIME_URL is set, else from the index they were resolved from.
 runtime = "/app/runtime.json"
 
 # The bucket every run's store goes to, under <prefix>/<run id>. A pod is gone
