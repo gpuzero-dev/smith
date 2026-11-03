@@ -887,6 +887,16 @@ class Unreachable(Exception):
     pass
 
 
+class Refusal(RuntimeError):
+    """The backend answered with an error status, kept as ``status`` so that
+    a caller can tell a refusal of what was asked (4xx) from a backend that
+    is failing for a moment (5xx, as during a deploy)."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 class Backend:
     def __init__(self, base: str, token: Optional[str] = None) -> None:
         self.base = base
@@ -907,7 +917,7 @@ class Backend:
                 answer = json.loads(response.read().decode("utf-8") or "null")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
-            raise RuntimeError("%s %s: %d %s" % (method, path, exc.code, detail)) from None
+            raise Refusal("%s %s: %d %s" % (method, path, exc.code, detail), exc.code) from None
         except (urllib.error.URLError, OSError) as exc:
             if self._down_since is None:
                 self._down_since = time.monotonic()
@@ -1806,12 +1816,19 @@ class Agent:
                 return
             except Unreachable:
                 time.sleep(POLL_SECONDS * 2)
-            except RuntimeError as exc:
-                if state != INTERRUPTED:
+            except Refusal as exc:
+                if state != INTERRUPTED or exc.status >= 500:
+                    if state == INTERRUPTED:
+                        # A backend failing for a moment, as during a deploy:
+                        # the same word again, not a different one.
+                        time.sleep(POLL_SECONDS * 2)
+                        continue
                     raise
-                # A backend older than this state refuses it (a 400), and
-                # asking again would be refused for ever: the job ended, and
-                # that is what it is told.
+                if exc.status not in (400, 422):
+                    raise
+                # A backend older than this state refuses it (a 400, or a 422
+                # from its validation), and asking again would be refused for
+                # ever: the job ended, and that is what it is told.
                 log("job %d: the backend does not take %r (%s); reporting it failed" % (job_id, state, exc))
                 state = "failed"
 

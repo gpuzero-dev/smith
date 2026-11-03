@@ -227,7 +227,38 @@ def test_a_backend_that_refuses_interrupted_is_told_failed_instead(monkeypatch):
     def report(job_id, state, message=None, run_id=None):
         sent.append(state)
         if state == smith.INTERRUPTED:
-            raise RuntimeError("PATCH /api/jobs/1: 400 state 'interrupted' is not one an agent reports")
+            raise smith.Refusal("PATCH /api/jobs/1: 400 state 'interrupted' is not one an agent reports", 400)
+        return {}
+
+    monkeypatch.setattr(agent, "report", report)
+    agent._report_until_heard(1, smith.INTERRUPTED, "m", "r")
+    assert sent == [smith.INTERRUPTED, "failed"]
+
+
+def test_a_backend_failing_for_a_moment_is_told_interrupted_again(monkeypatch):
+    agent = _agent()
+    sent = []
+
+    def report(job_id, state, message=None, run_id=None):
+        sent.append(state)
+        if len(sent) == 1:
+            raise smith.Refusal("PATCH /api/jobs/1: 503 deploying", 503)
+        return {}
+
+    monkeypatch.setattr(agent, "report", report)
+    monkeypatch.setattr(smith.time, "sleep", lambda _s: None)
+    agent._report_until_heard(1, smith.INTERRUPTED, "m", "r")
+    assert sent == [smith.INTERRUPTED, smith.INTERRUPTED]
+
+
+def test_a_validation_refusal_422_also_falls_back_to_failed(monkeypatch):
+    agent = _agent()
+    sent = []
+
+    def report(job_id, state, message=None, run_id=None):
+        sent.append(state)
+        if state == smith.INTERRUPTED:
+            raise smith.Refusal("PATCH /api/jobs/1: 422 unprocessable", 422)
         return {}
 
     monkeypatch.setattr(agent, "report", report)
