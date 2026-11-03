@@ -36,7 +36,7 @@ RUN pip install psutil
 
 # ─── libraries from PyPI ───────────────────────────────────────────────
 FROM base AS libs-pypi
-ARG MOONCLIP_VERSION=0.3.1
+ARG MOONCLIP_VERSION=0.3.2
 ARG RAVEX_VERSION=0.10.1
 RUN pip install "moonclip==${MOONCLIP_VERSION}" "ravex==${RAVEX_VERSION}"
 # The scripts smith.docker.toml offers are Ravex's examples, which the wheel

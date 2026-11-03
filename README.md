@@ -128,7 +128,14 @@ On a node, what differs between machines comes from the environment:
 `SMITH_BACKEND`, `SMITH_TOKEN`, `SMITH_NAME`,
 `SMITH_HARDWARE`, `SMITH_GPUS`, `SMITH_STORAGE_*`, and the
 bucket's `MOONCLIP_S3_ACCESS_KEY` / `MOONCLIP_S3_SECRET_KEY`, which Moonclip
-reads itself.
+reads itself. A job's storage on AWS may come with a region and no keys: the
+node's instance role writes the bucket (Moonclip 0.3.2 or later), and the run is
+given no `MOONCLIP_S3_*`.
+On EC2, smith also watches the metadata service for a spot interruption notice
+(`AWS_EC2_METADATA_SERVICE_ENDPOINT`, else `169.254.169.254`): it is asked once at
+start and, where nothing answers, never again; on a notice the running job is
+stopped as a cancel does, so Ravex writes its last checkpoint, and no further job
+is taken.
 `SMITH_IMAGE`, which the GPU image sets to its own tag, is written as the first
 line of every job's output: `[smith] image ghcr.io/.../smith-gpu:<commit>`.
 

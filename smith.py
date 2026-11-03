@@ -87,6 +87,19 @@ the process is interrupted the way Ctrl-C would: Ravex sees a
 ``KeyboardInterrupt``, writes its final checkpoint and records the run as
 ``interrupted``. One that has not exited a minute later is killed.
 
+**A bucket without keys (GPU-331).** A job's storage on AWS may come with a
+region and no keys: the node's instance role writes the bucket, and the run is
+given no ``MOONCLIP_S3_*`` for Moonclip (0.3.2 or later) to find the role
+instead. Without a region it is refused as a bucket whose keys went missing.
+
+**A spot node taken back (GPU-331).** At start the agent asks the metadata
+service (``AWS_EC2_METADATA_SERVICE_ENDPOINT``, else the link-local address)
+once, with a second to answer; where nothing does, as anywhere but on EC2, it
+asks no more. Otherwise it asks every five seconds for the spot interruption
+notice, and on one it stops the running job as a cancel does, so that Ravex
+writes its last checkpoint in the two minutes left, and takes no further job.
+The failure it reports says the provider reclaimed the machine.
+
 **What one machine compiled, the next one does not (GPU-181).** The wheels
 uv builds from source - flash-attn takes from minutes to hours - and the
 kernels Triton, Inductor and TileLang compile on first use go to directories
@@ -151,6 +164,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import urllib.error
@@ -696,11 +710,18 @@ class Bucket:
     @classmethod
     def from_job(cls, table: Dict[str, Any]) -> "Bucket":
         """The bucket a backend handed with a job, keys included: that job's
-        store goes there instead of this agent's bucket."""
+        store goes there instead of this agent's bucket.
+
+        Keys may be left out when the bucket is on AWS and names its region:
+        the node then has a role of its own that may write there, and the run
+        is given no key variables so that Moonclip takes the role's. Without a
+        region there is nothing to tell a bucket on AWS from a backend that
+        forgot the keys, and it is refused."""
         kind = str(table.get("type") or "s3")
         if kind not in ("s3", "r2") or not table.get("bucket"):
             raise RuntimeError("the job's storage is not a bucket this agent can use")
-        if not (table.get("access_key") and table.get("secret_key")):
+        keyed = bool(table.get("access_key") and table.get("secret_key"))
+        if not keyed and (table.get("access_key") or table.get("secret_key") or not table.get("region")):
             raise RuntimeError("the job's storage came without its keys")
         return cls(
             type=kind,
@@ -709,9 +730,9 @@ class Bucket:
             endpoint=table.get("endpoint"),
             region=table.get("region"),
             path_style=bool(table.get("path_style")),
-            access_key=str(table["access_key"]),
-            secret_key=str(table["secret_key"]),
-            session_token=str(table["session_token"]) if table.get("session_token") else None,
+            access_key=str(table["access_key"]) if keyed else None,
+            secret_key=str(table["secret_key"]) if keyed else None,
+            session_token=str(table["session_token"]) if keyed and table.get("session_token") else None,
         )
 
     @classmethod
@@ -766,6 +787,84 @@ class Bucket:
             if self.session_token:
                 env["MOONCLIP_S3_SESSION_TOKEN"] = self.session_token
         return env
+
+
+# ─── the spot interruption notice ───────────────────────────────────
+
+
+class SpotWatcher:
+    """Tells the agent that AWS is taking this machine back.
+
+    A spot instance gets a notice two minutes before it is terminated, on the
+    metadata service (IMDSv2) at ``spot/instance-action``; it answers 404
+    until then. Two minutes is enough for a run that is told to stop to write
+    its last checkpoint, and not for one that finds out when the machine goes.
+
+    ``start`` asks once, with a one-second timeout, and where nothing answers
+    - any machine that is not on EC2 - the watcher stays off and costs the
+    start nothing. Otherwise a daemon thread asks again every ``poll_seconds``
+    and calls ``on_notice`` once. The thread does nothing else: what to stop,
+    and how, is the agent's.
+    """
+
+    def __init__(self, on_notice: Any, poll_seconds: float = 5.0, timeout: float = 1.0) -> None:
+        self.on_notice = on_notice
+        self.poll_seconds = poll_seconds
+        self.timeout = timeout
+        # The variable the AWS SDKs read too, which is also how a test or an
+        # emulator stands in for the address that exists only on EC2.
+        self.endpoint = (os.environ.get("AWS_EC2_METADATA_SERVICE_ENDPOINT") or "http://169.254.169.254").rstrip("/")
+        self.thread: Optional[threading.Thread] = None
+
+    def notice(self) -> bool:
+        """Whether a notice is posted. An OSError, a refused or unanswered
+        request, means the service is not there to ask."""
+        # A token each time: it is two requests to a local address, and one
+        # that expired or was lost in a restart of the service cannot go wrong.
+        token = urllib.request.Request(
+            self.endpoint + "/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        with urllib.request.urlopen(token, timeout=self.timeout) as answer:
+            session = answer.read().decode("ascii", "replace").strip()
+        action = urllib.request.Request(
+            self.endpoint + "/latest/meta-data/spot/instance-action",
+            headers={"X-aws-ec2-metadata-token": session},
+        )
+        try:
+            with urllib.request.urlopen(action, timeout=self.timeout):
+                return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return False
+            raise
+
+    def start(self) -> bool:
+        """Probe once; True if the watcher is running."""
+        try:
+            posted = self.notice()
+        except (OSError, ValueError):
+            return False
+        if posted:
+            self.on_notice()
+            return True
+        self.thread = threading.Thread(target=self._poll, name="spot-watcher", daemon=True)
+        self.thread.start()
+        return True
+
+    def _poll(self) -> None:
+        while True:
+            time.sleep(self.poll_seconds)
+            try:
+                posted = self.notice()
+            except (OSError, ValueError):
+                # A service that answered at start and misses a beat is not
+                # one that has stopped: ask again.
+                continue
+            if posted:
+                self.on_notice()
+                return
 
 
 # ─── the backend ────────────────────────────────────────────────────
@@ -1006,6 +1105,8 @@ class Running:
         self.job = job
         self.id = int(job["id"])
         self.stop_requested_at: Optional[float] = None
+        #: Why it was told to stop, for the log and the failure's message.
+        self.stop_reason = "cancelled by the backend"
         self.last_report = 0.0
         #: When its kernels next go to its cache while it runs, and the push
         #: under way, so that two never overlap.
@@ -1286,11 +1387,12 @@ class Running:
         root = os.path.join(config.runs, "_code", place)
         return {**code, "repo": repo, "commit": commit, "manifest": manifest, "root": root}
 
-    def stop(self) -> None:
+    def stop(self, reason: str = "cancelled by the backend") -> None:
         now = time.monotonic()
         if self.stop_requested_at is None:
             self.stop_requested_at = now
-            log("job %d cancelled by the backend; interrupting pid %d" % (self.id, self.process.pid))
+            self.stop_reason = reason
+            log("job %d %s; interrupting pid %d" % (self.id, reason, self.process.pid))
             try:
                 if os.name == "nt":
                     os.kill(self.process.pid, signal.CTRL_BREAK_EVENT)
@@ -1425,6 +1527,26 @@ class Agent:
         #: What is wrong with this machine, when its GPUs failed the check:
         #: said in every heartbeat, and no job is taken while it stands.
         self.fault: Optional[str] = None
+        #: Set, from the spot watcher's thread, when AWS has said it takes this
+        #: machine back. An event and not a call into the job: the main loop
+        #: is the only one that touches the process.
+        self.reclaimed = threading.Event()
+        self.spot: Optional[SpotWatcher] = None
+
+    def takes_jobs(self) -> bool:
+        """Whether to claim a job: not with a fault, and not on a machine
+        that is about to go, where it would start work to lose."""
+        return self.fault is None and not self.reclaimed.is_set()
+
+    def start_spot_watch(self) -> None:
+        self.spot = SpotWatcher(self.on_spot_notice)
+        if self.spot.start():
+            log("watching for a spot interruption notice")
+
+    def on_spot_notice(self) -> None:
+        if not self.reclaimed.is_set():
+            log("the provider will reclaim this machine soon")
+            self.reclaimed.set()
 
     def install_runtime(self) -> None:
         """Fetch and install the heavy part of the job's Python before
@@ -1571,7 +1693,8 @@ class Agent:
             self.send_logs()
             self.current = None
             if running.stop_requested_at is not None:
-                state, message = "failed", "stopped on request"
+                state = "failed"
+                message = "stopped on request" if running.stop_reason == "cancelled by the backend" else running.stop_reason
             elif code == 0:
                 state, message = "finished", None
             else:
@@ -1585,6 +1708,11 @@ class Agent:
             pushing = running.push_caches(self.config)
             if pushing is not None:
                 self.pushing.append(pushing)
+            return
+        if self.reclaimed.is_set() and running.stop_requested_at is None:
+            # The same interruption as a cancel, so that Ravex writes its last
+            # checkpoint in the time the notice leaves.
+            running.stop("the provider is reclaiming this machine")
             return
         if running.stop_requested_at is not None:
             running.stop()
@@ -1715,6 +1843,7 @@ class Agent:
         if self.config.check_gpus and self.fault is None:
             self.check_gpus()
         self.reconcile()
+        self.start_spot_watch()
         polled = 0.0
         while True:
             # Before the heartbeat: it needs no answer from the backend to
@@ -1728,7 +1857,7 @@ class Agent:
             self.ship()
             try:
                 self.beat()
-                if self.current is None and self.fault is None:
+                if self.current is None and self.takes_jobs():
                     self.take()
                 else:
                     self.watch()
