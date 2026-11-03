@@ -192,6 +192,30 @@ def test_run_starts_the_watcher_after_the_start_up_work(monkeypatch):
     assert order == ["reconcile", "watch"]
 
 
+
+def test_a_reclaimed_agent_with_no_job_left_keeps_its_loop(monkeypatch):
+    # Once the interrupted job is reported the agent has no job and takes
+    # none: its loop goes on (heartbeats, logs, the rendezvous it may still
+    # serve) until the machine goes, rather than asking after a job it has
+    # not got and dying of it (found by the AWS bench, GPU-331).
+    agent = _agent()
+    agent.reclaimed.set()
+    for name in ("reconcile", "start_spot_watch", "send_logs", "ship", "beat"):
+        monkeypatch.setattr(agent, name, lambda: None)
+    taken = []
+    monkeypatch.setattr(agent, "take", lambda: taken.append(True))
+
+    class _Stop(Exception):
+        pass
+
+    def stop(_seconds):
+        raise _Stop
+
+    monkeypatch.setattr(smith.time, "sleep", stop)
+    with pytest.raises(_Stop):
+        agent.run()
+    assert agent.current is None and taken == []
+
 def _finished_by(stop_reason):
     agent = _agent()
     running, _stopped = _running()

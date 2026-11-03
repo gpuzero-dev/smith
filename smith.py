@@ -1896,8 +1896,12 @@ class Agent:
             self.ship()
             try:
                 self.beat()
-                if self.current is None and self.takes_jobs():
-                    self.take()
+                if self.current is None:
+                    # None taken on a machine that is going, or with a
+                    # fault: the loop still beats, sends logs and serves a
+                    # rendezvous, with nothing to watch.
+                    if self.takes_jobs():
+                        self.take()
                 else:
                     self.watch()
             except Unreachable:
