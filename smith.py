@@ -98,7 +98,9 @@ once, with a second to answer; where nothing does, as anywhere but on EC2, it
 asks no more. Otherwise it asks every five seconds for the spot interruption
 notice, and on one it stops the running job as a cancel does, so that Ravex
 writes its last checkpoint in the two minutes left, and takes no further job.
-The failure it reports says the provider reclaimed the machine.
+It reports the job as ``interrupted`` and not ``failed``, for a backend that
+carries a run on from a machine taken back; one that does not know the state
+refuses it, and the job is then reported ``failed``.
 
 **What one machine compiled, the next one does not (GPU-181).** The wheels
 uv builds from source - flash-attn takes from minutes to hours - and the
@@ -182,6 +184,17 @@ REPORT_SECONDS = 4.0
 
 #: How long a job that was asked to stop has before it is killed.
 STOP_GRACE_SECONDS = 60.0
+
+#: Why a job was told to stop, as the log says it and, for the first, as the
+#: failure's message does: a cancel on the backend, and a notice that the
+#: provider takes the machine back.
+CANCELLED = "cancelled by the backend"
+RECLAIMED = "the provider is reclaiming this machine"
+
+#: The state reported for a job stopped by that notice. A backend that carries
+#: runs on from an interrupted machine does so on this word; one that does not
+#: know it refuses it with a 4xx, and the report is made again as a failure.
+INTERRUPTED = "interrupted"
 
 #: Seconds between two attempts at sending what a finished run left unsent.
 SHIP_RETRY_SECONDS = 30.0
@@ -1106,7 +1119,7 @@ class Running:
         self.id = int(job["id"])
         self.stop_requested_at: Optional[float] = None
         #: Why it was told to stop, for the log and the failure's message.
-        self.stop_reason = "cancelled by the backend"
+        self.stop_reason = CANCELLED
         self.last_report = 0.0
         #: When its kernels next go to its cache while it runs, and the push
         #: under way, so that two never overlap.
@@ -1387,7 +1400,7 @@ class Running:
         root = os.path.join(config.runs, "_code", place)
         return {**code, "repo": repo, "commit": commit, "manifest": manifest, "root": root}
 
-    def stop(self, reason: str = "cancelled by the backend") -> None:
+    def stop(self, reason: str = CANCELLED) -> None:
         now = time.monotonic()
         if self.stop_requested_at is None:
             self.stop_requested_at = now
@@ -1692,9 +1705,10 @@ class Agent:
                 output.done = True
             self.send_logs()
             self.current = None
-            if running.stop_requested_at is not None:
-                state = "failed"
-                message = "stopped on request" if running.stop_reason == "cancelled by the backend" else running.stop_reason
+            if running.stop_requested_at is not None and running.stop_reason == RECLAIMED:
+                state, message = INTERRUPTED, "the provider reclaimed the machine"
+            elif running.stop_requested_at is not None:
+                state, message = "failed", "stopped on request"
             elif code == 0:
                 state, message = "finished", None
             else:
@@ -1712,7 +1726,7 @@ class Agent:
         if self.reclaimed.is_set() and running.stop_requested_at is None:
             # The same interruption as a cancel, so that Ravex writes its last
             # checkpoint in the time the notice leaves.
-            running.stop("the provider is reclaiming this machine")
+            running.stop(RECLAIMED)
             return
         if running.stop_requested_at is not None:
             running.stop()
@@ -1792,6 +1806,14 @@ class Agent:
                 return
             except Unreachable:
                 time.sleep(POLL_SECONDS * 2)
+            except RuntimeError as exc:
+                if state != INTERRUPTED:
+                    raise
+                # A backend older than this state refuses it (a 400), and
+                # asking again would be refused for ever: the job ended, and
+                # that is what it is told.
+                log("job %d: the backend does not take %r (%s); reporting it failed" % (job_id, state, exc))
+                state = "failed"
 
     def reconcile(self) -> None:
         """Close the jobs the backend still thinks this agent is running.

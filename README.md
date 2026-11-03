@@ -135,7 +135,8 @@ On EC2, smith also watches the metadata service for a spot interruption notice
 (`AWS_EC2_METADATA_SERVICE_ENDPOINT`, else `169.254.169.254`): it is asked once at
 start and, where nothing answers, never again; on a notice the running job is
 stopped as a cancel does, so Ravex writes its last checkpoint, and no further job
-is taken.
+is taken. The job is reported with state `interrupted` (`failed` to a backend that
+refuses it), for a backend that carries runs on from a machine taken back.
 `SMITH_IMAGE`, which the GPU image sets to its own tag, is written as the first
 line of every job's output: `[smith] image ghcr.io/.../smith-gpu:<commit>`.
 

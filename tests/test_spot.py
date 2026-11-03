@@ -164,3 +164,72 @@ def test_a_node_that_is_being_reclaimed_takes_no_job():
     agent = _agent()
     agent.reclaimed.set()
     assert agent.takes_jobs() is False
+
+
+def test_a_notice_already_posted_at_the_probe_calls_back_and_needs_no_thread(imds):
+    imds.notice = '{"action": "terminate", "time": "2026-11-02T10:00:00Z"}'
+    heard = []
+    watcher = smith.SpotWatcher(lambda: heard.append(1), poll_seconds=60)
+    assert watcher.start() is True
+    assert heard == [1] and watcher.thread is None
+
+
+def test_run_starts_the_watcher_after_the_start_up_work(monkeypatch):
+    agent = _agent()
+    order = []
+    monkeypatch.setattr(agent, "reconcile", lambda: order.append("reconcile"))
+    monkeypatch.setattr(agent, "start_spot_watch", lambda: order.append("watch"))
+
+    class _Stop(Exception):
+        pass
+
+    def stop(_seconds):
+        raise _Stop
+
+    monkeypatch.setattr(smith.time, "sleep", stop)
+    with pytest.raises(_Stop):
+        agent.run()
+    assert order == ["reconcile", "watch"]
+
+
+def _finished_by(stop_reason):
+    agent = _agent()
+    running, _stopped = _running()
+    running.process = types.SimpleNamespace(poll=lambda: 0)
+    running.stop_requested_at = time.monotonic() if stop_reason else None
+    running.stop_reason = stop_reason or smith.CANCELLED
+    running.close = lambda: None
+    running.rendezvous = None
+    running.outputs = []
+    running.store = "store"
+    running.push_caches = lambda _config: None
+    agent.current = running
+    agent.send_logs = lambda: None
+    heard = []
+    agent._report_until_heard = lambda *args: heard.append(args[1:3])
+    agent.watch()
+    return heard
+
+
+def test_a_job_stopped_by_the_notice_is_reported_interrupted():
+    assert _finished_by(smith.RECLAIMED) == [(smith.INTERRUPTED, "the provider reclaimed the machine")]
+
+
+def test_a_cancelled_job_is_still_reported_failed_and_a_clean_exit_finished():
+    assert _finished_by(smith.CANCELLED) == [("failed", "stopped on request")]
+    assert _finished_by(None) == [("finished", None)]
+
+
+def test_a_backend_that_refuses_interrupted_is_told_failed_instead(monkeypatch):
+    agent = _agent()
+    sent = []
+
+    def report(job_id, state, message=None, run_id=None):
+        sent.append(state)
+        if state == smith.INTERRUPTED:
+            raise RuntimeError("PATCH /api/jobs/1: 400 state 'interrupted' is not one an agent reports")
+        return {}
+
+    monkeypatch.setattr(agent, "report", report)
+    agent._report_until_heard(1, smith.INTERRUPTED, "m", "r")
+    assert sent == [smith.INTERRUPTED, "failed"]
