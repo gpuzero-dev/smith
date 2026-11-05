@@ -125,6 +125,11 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
+# A node the backend has not answered for half an hour stops its job, with a
+# last checkpoint, and gives itself back (GPU-365): with the backend down no
+# reaper ends it, and its GPUs are billed to someone for as long as it lasts.
+ENV SMITH_ALONE_MINUTES=30
+
 # The compiler TileLang builds a kernel with on first use: nvcc, the CUDA
 # runtime's headers and CCCL, and g++ as nvcc's host compiler. From NVIDIA's
 # apt repository at 12.8, the line torch was built for. Not from pip: at 12.x
