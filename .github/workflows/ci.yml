@@ -35,6 +35,22 @@ jobs:
               assert config.get("scripts"), path
               print("ok", path)
           EOF
+      # The images install pinned releases, and a fix released in Ravex or
+      # Moonclip reaches no node until the pin moves: 0.11.0's SIGTERM fix sat
+      # unused behind 0.10.1 for a week (GPU-366). Red until both Dockerfiles
+      # name the newest release of each.
+      - name: The images pin the newest Ravex and Moonclip
+        run: |
+          python - <<'EOF'
+          import json, re, urllib.request
+          for library in ("ravex", "moonclip"):
+              with urllib.request.urlopen("https://pypi.org/pypi/%s/json" % library, timeout=30) as answer:
+                  newest = json.load(answer)["info"]["version"]
+              for path in ("Dockerfile", "Dockerfile.gpu"):
+                  pinned = re.search(r"^ARG %s_VERSION=(\S+)$" % library.upper(), open(path).read(), re.M).group(1)
+                  assert pinned == newest, "%s pins %s %s; the newest on PyPI is %s" % (path, library, pinned, newest)
+                  print("ok", path, library, pinned)
+          EOF
       # pytest for the tests only, after the checks above have run on a bare
       # interpreter. Without Moonclip the bucket's tests skip: those run where
       # there is an S3 server (tests/test_cache_s3.py says how).
