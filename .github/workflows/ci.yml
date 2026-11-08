@@ -35,6 +35,29 @@ jobs:
               assert config.get("scripts"), path
               print("ok", path)
           EOF
+      # The images install the libraries' latest releases (GPU-366): until
+      # 2026-11-08 they installed ravex 0.10.1 while 0.11.x was out, and the
+      # nodes ignored a stop that the docs said saves first. A release of
+      # either turns this red until both Dockerfiles are moved to it.
+      - name: The images pin the latest releases
+        run: |
+          python - <<'EOF'
+          import json, re, urllib.request
+          pins = {}
+          for path in ("Dockerfile", "Dockerfile.gpu"):
+              text = open(path, encoding="utf-8").read()
+              for name in ("RAVEX", "MOONCLIP"):
+                  found = re.findall(r"^ARG %s_VERSION=(\S+)$" % name, text, re.M)
+                  assert len(found) == 1, (path, name, found)
+                  pins.setdefault(name.lower(), set()).add(found[0])
+          for package, versions in sorted(pins.items()):
+              assert len(versions) == 1, "the two Dockerfiles pin %s differently: %s" % (package, sorted(versions))
+              with urllib.request.urlopen("https://pypi.org/pypi/%s/json" % package, timeout=30) as answer:
+                  latest = json.load(answer)["info"]["version"]
+              pinned = versions.pop()
+              assert pinned == latest, "%s: the images pin %s, PyPI's latest is %s" % (package, pinned, latest)
+              print("ok", package, pinned)
+          EOF
       # pytest for the tests only, after the checks above have run on a bare
       # interpreter. Without Moonclip the bucket's tests skip: those run where
       # there is an S3 server (tests/test_cache_s3.py says how).
