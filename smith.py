@@ -102,6 +102,23 @@ It reports the job as ``interrupted`` and not ``failed``, for a backend that
 carries a run on from a machine taken back; one that does not know the state
 refuses it, and the job is then reported ``failed``.
 
+**A node the backend no longer answers (GPU-365).** Budgets and idle nodes
+are the backend's to enforce: its reaper gives a machine back. With the
+backend down nobody does, and a customer's GPUs would stay on, billed to
+their account, for as long as the outage lasts. So with ``alone_minutes``
+(``SMITH_ALONE_MINUTES``; 30 in the GPU image, off elsewhere) an agent that
+has heard nothing from the backend for that long - no answer at all, or only
+5xx, which is what a proxy in front of a stopped backend sends - stops its
+job as a cancel does, so Ravex writes its last checkpoint to the bucket, and
+then ends the machine. On RunPod and vast.ai it deletes its own pod or
+instance with the key the provider puts in every one for that
+(``RUNPOD_POD_ID`` and ``RUNPOD_API_KEY``, ``CONTAINER_ID`` and
+``CONTAINER_API_KEY``): a container that merely exits is restarted, or kept
+and billed for its disk. Elsewhere it exits with :data:`ALONE_EXIT`, and
+what started it decides: on AWS the instance's user data shuts the instance
+down once the agent's container ends, which its launch template turns into
+a termination. A laptop running smith with the setting off is never touched.
+
 **What one machine compiled, the next one does not (GPU-181).** The wheels
 uv builds from source - flash-attn takes from minutes to hours - and the
 kernels Triton, Inductor and TileLang compile on first use go to directories
@@ -170,6 +187,7 @@ import threading
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -195,6 +213,12 @@ RECLAIMED = "the provider is reclaiming this machine"
 #: runs on from an interrupted machine does so on this word; one that does not
 #: know it refuses it with a 4xx, and the report is made again as a failure.
 INTERRUPTED = "interrupted"
+
+#: Why a job was told to stop when the backend had been silent for too long,
+#: and the exit code of an agent that gave up on it (GPU-365): not 0, which
+#: reads as a clean end, and not 1, which reads as a crash.
+ALONE = "the backend has not answered for too long"
+ALONE_EXIT = 75
 
 #: Seconds between two attempts at sending what a finished run left unsent.
 SHIP_RETRY_SECONDS = 30.0
@@ -641,6 +665,10 @@ class Config:
     #: and installs before the first job (``runtime`` in the file); None where
     #: the environment already has it all.
     runtime: Optional[str] = None
+    #: Minutes without a word from the backend after which the job is
+    #: stopped and the machine ended (see "A node the backend no longer
+    #: answers" above); 0 never.
+    alone_minutes: float = 0.0
 
     @classmethod
     def load(cls, path: str) -> "Config":
@@ -698,6 +726,7 @@ class Config:
             ).lower() in ("true", "1", "yes"),
             cache_service=str(env("SMITH_CACHE") or raw.get("cache", "")).lower() == "backend",
             runtime=resolve(raw["runtime"]) if raw.get("runtime") else None,
+            alone_minutes=max(0.0, float(env("SMITH_ALONE_MINUTES") or raw.get("alone_minutes", 0) or 0)),
         )
 
 
@@ -901,6 +930,9 @@ class Backend:
     def __init__(self, base: str, token: Optional[str] = None) -> None:
         self.base = base
         self._down_since: Optional[float] = None
+        #: When the backend last answered with anything but a 5xx: from the
+        #: start, so that one never heard is given the same time.
+        self.heard_at = time.monotonic()
         # A name of its own: urllib's default, Python-urllib/3.x, is one that
         # a CDN in front of a backend may refuse outright as a bot (Cloudflare
         # answers 403 with error 1010), and every call would fail before it
@@ -917,16 +949,26 @@ class Backend:
                 answer = json.loads(response.read().decode("utf-8") or "null")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
+            if exc.code < 500:
+                # A refusal is an answer: whoever refused is there, and so
+                # is its reaper. A 5xx is not one - it is what a CDN or a
+                # proxy says for a backend that has stopped.
+                self.heard_at = time.monotonic()
             raise Refusal("%s %s: %d %s" % (method, path, exc.code, detail), exc.code) from None
         except (urllib.error.URLError, OSError) as exc:
             if self._down_since is None:
                 self._down_since = time.monotonic()
                 log("backend %s unreachable (%s); jobs already running carry on" % (self.base, exc))
             raise Unreachable(str(exc)) from None
+        self.heard_at = time.monotonic()
         if self._down_since is not None:
             log("backend reachable again")
             self._down_since = None
         return answer
+
+    def silent_for(self) -> float:
+        """Seconds since the backend last answered."""
+        return time.monotonic() - self.heard_at
 
 
 # ─── a job, running ─────────────────────────────────────────────────
@@ -1571,6 +1613,74 @@ class Agent:
             log("the provider will reclaim this machine soon")
             self.reclaimed.set()
 
+    def alone(self) -> bool:
+        """Whether the backend has been silent for longer than the agent
+        waits for it (GPU-365)."""
+        limit = self.config.alone_minutes
+        return limit > 0 and self.backend.silent_for() > limit * 60
+
+    def give_up(self) -> None:
+        """Stop the job, end the machine, and exit.
+
+        The job is stopped as a cancel stops it, and waited for: Ravex
+        writes its last checkpoint to the bucket, which does not need the
+        backend. Not reported: there is nobody to report to, and when the
+        backend comes back its reaper finds the node gone and the run where
+        the checkpoint left it."""
+        log(
+            "the backend has not answered for %.0f minutes; stopping and giving this machine back"
+            % (self.backend.silent_for() / 60)
+        )
+        running = self.current
+        if running is not None:
+            running.stop(ALONE)
+            while running.process.poll() is None:
+                time.sleep(LOG_SECONDS)
+                # A second call kills a job still there after the grace.
+                running.stop(ALONE)
+            running.close()
+            log("job %d stopped" % running.id)
+        for serving in (self.serving, running):
+            if serving is not None and getattr(serving, "rendezvous", None) is not None:
+                serving.stop_rendezvous()
+        self.end_machine()
+        raise SystemExit(ALONE_EXIT)
+
+    def end_machine(self) -> None:
+        """Delete this pod or instance with the key its provider gave it for
+        that, where there is one. Every failure is said and left: the exit
+        that follows is the last resort, and on AWS it is enough."""
+        env = os.environ.get
+        if env("RUNPOD_POD_ID") and env("RUNPOD_API_KEY"):
+            pod = urllib.parse.quote(env("RUNPOD_POD_ID", ""))
+            # Both of RunPod's REST APIs: the platform drives pods with v2,
+            # and RunPod's own documentation shows the pod's key with v1,
+            # which RunPod retires on 2026-11-15. Which one accepts a key
+            # scoped to the pod is not confirmed yet (GPU-365).
+            urls = ["https://api.runpod.io/v2/pods/" + pod, "https://rest.runpod.io/v1/pods/" + pod]
+            self._delete_self("RunPod pod", urls, env("RUNPOD_API_KEY", ""))
+        elif env("CONTAINER_ID") and env("CONTAINER_API_KEY"):
+            instance = urllib.parse.quote(env("CONTAINER_ID", ""))
+            self._delete_self("vast.ai instance", ["https://console.vast.ai/api/v0/instances/%s/" % instance],
+                              env("CONTAINER_API_KEY", ""))
+
+    def _delete_self(self, what: str, urls: List[str], key: str) -> None:
+        for url in urls:
+            request = urllib.request.Request(
+                url, method="DELETE", headers={"Authorization": "Bearer " + key, "User-Agent": "smith"}
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=TIMEOUT):
+                    pass
+            except urllib.error.HTTPError as exc:
+                log("%s: deleting it was refused at %s: %d" % (what, url, exc.code))
+                continue
+            except (urllib.error.URLError, OSError) as exc:
+                log("%s: could not ask to delete it at %s: %s" % (what, url, exc))
+                continue
+            log("%s: deletion asked for" % what)
+            return
+
     def install_runtime(self) -> None:
         """Fetch and install the heavy part of the job's Python before
         anything else, the GPU check included, which imports torch.
@@ -1908,6 +2018,8 @@ class Agent:
                 pass
             except RuntimeError as exc:
                 log(str(exc))
+            if self.alone():
+                self.give_up()
             time.sleep(LOG_SECONDS)
 
 
