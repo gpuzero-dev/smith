@@ -235,7 +235,13 @@ class SigningService:
                 service.objects[path] = data
                 return self._send(200)
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        class Server(ThreadingHTTPServer):
+            # socketserver queues 5 connections by default, and a push opens
+            # 16 at a time: on Linux the overflow came back to the client as
+            # "Connection reset by peer" and failed the push (GPU-385).
+            request_queue_size = 128
+
+        self.server = Server(("127.0.0.1", 0), Handler)
         self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
