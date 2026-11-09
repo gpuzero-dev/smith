@@ -72,7 +72,9 @@ with ``Authorization: Bearer <SMITH_CACHE_TOKEN>`` and a JSON body::
     {"op": "list", "path": "<prefix>"}  ->  {"paths": ["<path>", ...]}
 
 Paths are this module's, relative to the store's root; where that root is in
-the bucket is the service's business.
+the bucket is the service's business. A signature refused with 429, 502, 503
+or 504 is asked for again, a few times over some seconds (``RETRY_STATUSES``,
+GPU-385): those say "not now", and one refusal would cost the whole cache.
 """
 
 from __future__ import annotations
@@ -82,9 +84,11 @@ import hashlib
 import json
 import os
 import platform
+import random
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -162,6 +166,39 @@ class LocalStore:
 SIGNED_TIMEOUT = 600
 
 
+#: The answers of a signing service that say "not now" rather than "no": a
+#: proxy's limit (429) or a backend between two deploys (502, 503, 504). A
+#: pull asks for one signature per file, 16 at a time, and gave up on the
+#: first 429 of the nginx in front of the service, which threw away the whole
+#: cache for a moment's excess (GPU-385). These are asked again.
+RETRY_STATUSES = (429, 502, 503, 504)
+
+#: How many times one signature is asked for in all, and the longest wait
+#: between two: 0.5, 1, 2, 4 and 8 seconds at most, about 15 in all before
+#: the pull gives up and the machine compiles.
+SIGNED_ATTEMPTS = 6
+RETRY_FIRST = 0.5
+RETRY_LONGEST = 8.0
+
+#: Replaced in tests, which should not wait out a backoff.
+_sleep = time.sleep
+
+
+def _retry_wait(attempt: int, retry_after: Optional[str]) -> float:
+    """Seconds to wait before attempt ``attempt + 1``.
+
+    A ``Retry-After`` in seconds is taken as the service's own answer, up to
+    the longest wait; without one the wait doubles, with full jitter, so the
+    16 transfers that were refused together do not all come back together.
+    """
+    if retry_after is not None:
+        try:
+            return min(max(float(retry_after), 0.0), RETRY_LONGEST)
+        except ValueError:
+            pass
+    return random.uniform(0, min(RETRY_FIRST * (2 ** attempt), RETRY_LONGEST))
+
+
 class SignedStore:
     """A store whose every operation a service signs (see the module's
     docstring): no bucket key on this machine, only ``token`` for the service.
@@ -191,12 +228,18 @@ class SignedStore:
                 "User-Agent": "smith",
             },
         )
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                answer = json.loads(response.read().decode("utf-8") or "{}")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:300]
-            raise OSError("the signing service refused %s %s: %d %s" % (op, path, exc.code, detail)) from None
+        answer: object = None
+        for attempt in range(SIGNED_ATTEMPTS):
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    answer = json.loads(response.read().decode("utf-8") or "{}")
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:300]
+                if exc.code in RETRY_STATUSES and attempt + 1 < SIGNED_ATTEMPTS:
+                    _sleep(_retry_wait(attempt, exc.headers.get("Retry-After") if exc.headers else None))
+                    continue
+                raise OSError("the signing service refused %s %s: %d %s" % (op, path, exc.code, detail)) from None
         if not isinstance(answer, dict):
             raise ValueError("the signing service answered %s %s with %r" % (op, path, answer))
         return answer

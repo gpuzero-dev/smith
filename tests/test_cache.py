@@ -162,15 +162,29 @@ class SigningService:
         self.object_auth = []
         #: The size each put declared, by path: the bucket takes no other.
         self.declared = {}
+        #: How many signatures to refuse with ``busy_status`` before signing
+        #: again, as a proxy's rate limit does (GPU-385), and the
+        #: ``Retry-After`` they carry, if any.
+        self.busy = 0
+        self.busy_status = 429
+        self.retry_after = None
+        #: When set, the first signature asked for each (op, path) under
+        #: ``/files/`` is refused: a pull's burst, without leaving to chance
+        #: which of its transfers the limit falls on.
+        self.busy_once = False
+        self.refused = set()
+        self.lock = threading.Lock()
         service = self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
 
-            def _send(self, status, body=b"", kind="application/json"):
+            def _send(self, status, body=b"", kind="application/json", headers=()):
                 self.send_response(status)
                 self.send_header("Content-Type", kind)
+                for name, value in headers:
+                    self.send_header(name, value)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -180,6 +194,16 @@ class SigningService:
                 if self.headers.get("Authorization") != "Bearer " + service.token:
                     return self._send(401, b'{"detail": "no token"}')
                 op, path = body["op"], body["path"]
+                with service.lock:
+                    busy = service.busy > 0
+                    if busy:
+                        service.busy -= 1
+                    elif service.busy_once and "/files/" in path and (op, path) not in service.refused:
+                        service.refused.add((op, path))
+                        busy = True
+                if busy:
+                    extra = [("Retry-After", service.retry_after)] if service.retry_after else []
+                    return self._send(service.busy_status, b"<html>Too Many Requests</html>", "text/html", extra)
                 if op == "put" and path.startswith("ro/"):
                     return self._send(403, b'{"detail": "read-only"}')
                 if op == "list":
@@ -263,6 +287,74 @@ def test_a_refused_write_fails_the_push_and_says_why(tmp_path, monkeypatch, caps
     store = _cache.SignedStore(service.url + "/sign", service.token)
     with pytest.raises(OSError, match="403"):
         store.put("ro/wheels/x", b"x")
+
+
+@pytest.fixture
+def waits(monkeypatch):
+    """The waits of the signed store's backoff, recorded instead of slept."""
+    waited = []
+    monkeypatch.setattr(_cache, "_sleep", waited.append)
+    return waited
+
+
+def test_a_pull_waits_out_a_rate_limit_instead_of_dropping_the_cache(tmp_path, monkeypatch, service, waits):
+    """The nginx in front of the service answered a pull's burst of
+    signatures with 429, and the pull gave up on the first: the node compiled
+    everything the cache held (GPU-385)."""
+    monkeypatch.setattr(_cache, "gpu_capabilities", lambda: ["sm_89"])
+    monkeypatch.setenv("SMITH_CACHE_TOKEN", service.token)
+    first, second = str(tmp_path / "first"), str(tmp_path / "second")
+    files = {"k%02d.cubin" % index: b"kernel %d" % index for index in range(40)}
+    _fill(first, files)
+    store = "sign+%s/sign" % service.url
+    assert main(["push", "--name", "inductor", "--dir", first, "--store", store]) == 0
+
+    service.busy_once = True
+    assert main(["pull", "--name", "inductor", "--dir", second, "--store", store]) == 0
+
+    assert _read(second) == files
+    # The list of the files, then each file's signature: each refused once.
+    assert len(waits) == 1 + len(files)
+    assert all(0 <= wait <= _cache.RETRY_LONGEST for wait in waits)
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_a_backend_between_two_deploys_is_asked_again(service, waits, status):
+    service.objects["a/b"] = b"bytes"
+    service.busy, service.busy_status = 2, status
+
+    assert _cache.SignedStore(service.url + "/sign", service.token).get("a/b") == b"bytes"
+    assert len(waits) == 2
+
+
+def test_a_retry_after_is_the_wait(service, waits):
+    service.objects["a/b"] = b"bytes"
+    service.busy, service.retry_after = 1, "3"
+
+    assert _cache.SignedStore(service.url + "/sign", service.token).get("a/b") == b"bytes"
+    assert waits == [3.0]
+
+
+def test_the_wait_doubles_up_to_the_longest():
+    ceilings = [_cache.RETRY_FIRST * 2 ** attempt for attempt in range(10)]
+    for attempt, ceiling in enumerate(ceilings):
+        assert 0 <= _cache._retry_wait(attempt, None) <= min(ceiling, _cache.RETRY_LONGEST)
+    # A service asking for an hour gets the longest wait, not the hour.
+    assert _cache._retry_wait(0, "3600") == _cache.RETRY_LONGEST
+
+
+def test_a_limit_that_does_not_lift_still_fails_and_says_so(service, waits):
+    service.busy = _cache.SIGNED_ATTEMPTS
+
+    with pytest.raises(OSError, match="refused get a/b: 429"):
+        _cache.SignedStore(service.url + "/sign", service.token).get("a/b")
+    assert len(waits) == _cache.SIGNED_ATTEMPTS - 1
+
+
+def test_a_refusal_that_means_no_is_not_asked_again(service, waits):
+    with pytest.raises(OSError, match="403"):
+        _cache.SignedStore(service.url + "/sign", service.token).put("ro/x", b"x")
+    assert waits == []
 
 
 def test_a_signing_service_without_a_token_is_refused_by_name(tmp_path, monkeypatch, capsys):
