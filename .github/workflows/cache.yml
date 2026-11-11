@@ -72,7 +72,7 @@ jobs:
           fi
       # The workflow's own commit, which is main's: its runtime.py reads every
       # lock of version 1, an older image's too, which may predate fill.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: steps.secrets.outputs.ok == '1'
       # After image.yml, the image it just published: tagged with the short
       # commit it was built from, the head of the run that built it. By hand,
@@ -88,7 +88,7 @@ jobs:
           [ -n "$HEAD_SHA" ] && tag="${HEAD_SHA::7}"
           echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/smith-gpu:$tag" >> "$GITHUB_OUTPUT"
       # The image is public; logged in anyway, so a private one works the same.
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         if: steps.secrets.outputs.ok == '1'
         with:
           registry: ghcr.io
@@ -141,7 +141,7 @@ jobs:
       SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
       IMAGE: ghcr.io/${{ github.repository_owner }}/smith-gpu:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Asked before anything heavy: most hours there is nothing to build, and
       # the image is gigabytes.
       - name: Anything to build
@@ -153,7 +153,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           docker system prune -af
           df -h /
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         if: steps.pending.outputs.pending == '1'
         with:
           registry: ghcr.io
