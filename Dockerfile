@@ -72,8 +72,20 @@ RUN pip install /src/ravex \
     && mkdir -p /app && cp -r /src/ravex/examples /app/examples
 
 # ─── smith ─────────────────────────────────────────────────────────────
+# smith and every job it starts run as `smith`, not root (GPU-403): a script
+# is code from a repository, and in a container that runs as root a mistake in
+# one, or a dependency that misbehaves, can do whatever root can there. The
+# user owns what a job writes - the runs (`runs` in smith.docker.toml), the
+# examples' directory, which is a local script's working directory, and its
+# home, where pip, torch and the rest keep their caches. A runs volume made by
+# an image from before this one is root's: `docker compose run --rm --user
+# root <service> chown -R smith:smith /runs` hands it over once.
 FROM libs-${LIBS}
-COPY . /app/smith
+RUN useradd --create-home --uid 10001 --user-group smith \
+    && mkdir -p /runs \
+    && chown -R smith:smith /runs /app/examples
+COPY --chown=smith:smith . /app/smith
 WORKDIR /app
+USER smith
 
 CMD ["python", "smith/smith.py", "--config", "smith/smith.docker.toml"]
