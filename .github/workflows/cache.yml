@@ -26,6 +26,9 @@ name: Cache
 #
 # Secrets: SMITH_BACKEND, the backend's address, and SMITH_BUILDER_TOKEN, its
 # builder token. Without them (a fork) each job says so and does nothing.
+# They live in the `production` environment, which only main can enter,
+# rather than among the repository's secrets, which a workflow on any branch
+# can read: anyone who could push a branch could otherwise print them.
 
 on:
   schedule:
@@ -48,6 +51,7 @@ permissions:
 
 jobs:
   runtime:
+    environment: production
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -124,6 +128,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   wheels:
+    environment: production
     # Not after an image is published: that is the runtime's trigger, and the
     # build queue is asked on the hour anyway.
     if: github.event_name != 'workflow_run'
