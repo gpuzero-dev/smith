@@ -70,6 +70,12 @@ with ``Authorization: Bearer <SMITH_CACHE_TOKEN>`` and a JSON body::
     {"op": "get",  "path": "<path>"}    ->  {"url": "<presigned GET>"}
     {"op": "put",  "path": "<path>", "size": <bytes>}  ->  {"url": "<presigned PUT>"}
     {"op": "list", "path": "<prefix>"}  ->  {"paths": ["<path>", ...]}
+    {"op": "get_many", "path": "<prefix>", "paths": ["<path>", ...]}
+                                        ->  {"urls": {"<path>": "<presigned GET>", ...}}
+
+``get_many`` signs a pull's reads up to a thousand at a time (GPU-421): a
+kernel cache is hundreds of small files, and a signature asked for each was a
+round trip to the service per file - 705 of Triton's took 29 s on a node.
 
 Paths are this module's, relative to the store's root; where that root is in
 the bucket is the service's business. A signature refused with 429, 502, 503
@@ -199,6 +205,16 @@ def _retry_wait(attempt: int, retry_after: Optional[str]) -> float:
     return random.uniform(0, min(RETRY_FIRST * (2 ** attempt), RETRY_LONGEST))
 
 
+#: How many reads one ``get_many`` asks to sign: half the service's cap, so a
+#: request stays well inside it (GPU-421).
+SIGN_AT_ONCE = 500
+
+#: How long before a signed URL runs out it is no longer used: one signed in
+#: a batch waits for the transfers ahead of it, and on a slow link a URL can
+#: age past its life before its turn. Then it is signed again, alone.
+SIGNED_MARGIN = 60.0
+
+
 class SignedStore:
     """A store whose every operation a service signs (see the module's
     docstring): no bucket key on this machine, only ``token`` for the service.
@@ -207,9 +223,15 @@ class SignedStore:
     def __init__(self, address: str, token: str) -> None:
         self.address = address
         self.token = token
+        #: Reads signed ahead by :meth:`sign_reads`: path -> (URL, when it is
+        #: no longer to be used, by ``time.monotonic``).
+        self._signed: Dict[str, Tuple[str, float]] = {}
 
-    def _ask(self, op: str, path: str, size: Optional[int] = None) -> Dict[str, object]:
+    def _ask(self, op: str, path: str, size: Optional[int] = None,
+             paths: Optional[List[str]] = None) -> Dict[str, object]:
         asked: Dict[str, object] = {"op": op, "path": path}
+        if paths is not None:
+            asked["paths"] = paths
         if size is not None:
             # A put says how large it is: the service may sign the URL with
             # that length, so the bucket takes no more, and refuse a file
@@ -250,8 +272,29 @@ class SignedStore:
             raise ValueError("the signing service gave no URL for %s %s" % (op, path))
         return url
 
+    def sign_reads(self, prefix: str, paths: List[str]) -> None:
+        """Sign the reads of ``paths``, all under ``prefix``, :data:`SIGN_AT_ONCE`
+        to a request, for the :meth:`get` of each that follows (GPU-421)."""
+        for start in range(0, len(paths), SIGN_AT_ONCE):
+            batch = paths[start:start + SIGN_AT_ONCE]
+            answer = self._ask("get_many", prefix, paths=batch)
+            urls, expires = answer.get("urls"), answer.get("expires")
+            if not isinstance(urls, dict) or set(urls) != set(batch) or not all(
+                isinstance(url, str) and url.startswith(("https://", "http://")) for url in urls.values()
+            ):
+                raise ValueError("the signing service did not sign every read under %s" % prefix)
+            usable = time.monotonic() + max(0.0, float(expires if isinstance(expires, (int, float)) else 0) - SIGNED_MARGIN)
+            for path, url in urls.items():
+                self._signed[path] = (url, usable)
+
+    def _read_url(self, path: str) -> str:
+        signed = self._signed.pop(path, None)
+        if signed is not None and time.monotonic() < signed[1]:
+            return signed[0]
+        return self._url("get", path)
+
     def get(self, path: str) -> Optional[bytes]:
-        request = urllib.request.Request(self._url("get", path), headers={"User-Agent": "smith"})
+        request = urllib.request.Request(self._read_url(path), headers={"User-Agent": "smith"})
         try:
             with urllib.request.urlopen(request, timeout=SIGNED_TIMEOUT) as response:
                 return response.read()
@@ -454,6 +497,10 @@ def pull(store: Store, key: Key, directory: str) -> Outcome:
             raise ValueError("the store names a file outside the directory: %r" % relative)
         if relative not in have:
             wanted.append((path, target))
+    sign_reads = getattr(store, "sign_reads", None)
+    if sign_reads is not None and wanted:
+        # One request per few hundred reads rather than one per file (GPU-421).
+        sign_reads(prefix, [path for path, _ in wanted])
 
     def fetch(item: Tuple[str, str]) -> int:
         path, target = item

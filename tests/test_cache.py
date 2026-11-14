@@ -173,6 +173,10 @@ class SigningService:
         #: which of its transfers the limit falls on.
         self.busy_once = False
         self.refused = set()
+        #: Every operation asked for, in order, for a test to count.
+        self.asked = []
+        #: How long a signed URL lives, as the service says.
+        self.expires = 600
         self.lock = threading.Lock()
         service = self
 
@@ -195,6 +199,7 @@ class SigningService:
                     return self._send(401, b'{"detail": "no token"}')
                 op, path = body["op"], body["path"]
                 with service.lock:
+                    service.asked.append(op)
                     busy = service.busy > 0
                     if busy:
                         service.busy -= 1
@@ -209,6 +214,12 @@ class SigningService:
                 if op == "list":
                     paths = sorted(p for p in service.objects if p.startswith(path))
                     return self._send(200, json.dumps({"paths": paths}).encode())
+                if op == "get_many":
+                    urls = {
+                        one: "%s/objects/%s" % (service.url, urllib.parse.quote(one))
+                        for one in body["paths"]
+                    }
+                    return self._send(200, json.dumps({"urls": urls, "expires": service.expires}).encode())
                 if op == "put":
                     if not isinstance(body.get("size"), int):
                         return self._send(403, b'{"detail": "a put says its size"}')
@@ -319,8 +330,9 @@ def test_a_pull_waits_out_a_rate_limit_instead_of_dropping_the_cache(tmp_path, m
     assert main(["pull", "--name", "inductor", "--dir", second, "--store", store]) == 0
 
     assert _read(second) == files
-    # The list of the files, then each file's signature: each refused once.
-    assert len(waits) == 1 + len(files)
+    # The list of the files, then their signatures, all in one get_many since
+    # GPU-421: each refused once.
+    assert len(waits) == 2
     assert all(0 <= wait <= _cache.RETRY_LONGEST for wait in waits)
 
 
@@ -407,3 +419,36 @@ def test_files_move_several_at_a_time(tmp_path):
 
     assert (sent.files, got.files) == (8, 8)
     assert _read(second) == _read(first)
+
+
+def test_a_pull_of_many_files_asks_for_their_signatures_in_batches(tmp_path, monkeypatch, service):
+    """GPU-421: one signature per file was a round trip to the service per
+    file, 29 s for Triton's 705 on a node. The reads are signed a few hundred
+    at a time, and each file is then fetched from the bucket directly."""
+    monkeypatch.setattr(_cache, "gpu_capabilities", lambda: ["sm_89"])
+    monkeypatch.setattr(_cache, "SIGN_AT_ONCE", 4)
+    monkeypatch.setenv("SMITH_CACHE_TOKEN", service.token)
+    first, second = str(tmp_path / "first"), str(tmp_path / "second")
+    files = {"k%d.cubin" % index: b"kernel %d" % index for index in range(10)}
+    _fill(first, files)
+    store = "sign+%s/sign" % service.url
+    assert main(["push", "--name", "triton", "--dir", first, "--store", store]) == 0
+
+    service.asked.clear()
+    assert main(["pull", "--name", "triton", "--dir", second, "--store", store]) == 0
+
+    assert _read(second) == files
+    assert service.asked.count("get_many") == 3  # 10 reads, 4 to a batch
+    assert service.asked.count("get") == 1  # key.json alone
+
+
+def test_a_read_signed_too_long_ago_is_signed_again_alone(service):
+    """A URL signed in a batch waits for the transfers ahead of it; one that
+    has aged past its life, less a margin, is not used."""
+    service.objects["a/b"] = b"bytes"
+    service.expires = 30  # under SIGNED_MARGIN: already too old to use
+    store = _cache.SignedStore(service.url + "/sign", service.token)
+    store.sign_reads("a/", ["a/b"])
+    service.asked.clear()
+    assert store.get("a/b") == b"bytes"
+    assert service.asked == ["get"]
