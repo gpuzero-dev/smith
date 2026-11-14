@@ -288,3 +288,29 @@ def test_a_validation_refusal_422_also_falls_back_to_failed(monkeypatch):
     monkeypatch.setattr(agent, "report", report)
     agent._report_until_heard(1, smith.INTERRUPTED, "m", "r")
     assert sent == [smith.INTERRUPTED, "failed"]
+
+
+def test_the_launcher_leaves_sigterm_to_the_script(tmp_path):
+    """A stop is a SIGTERM on Linux, and the launcher no longer turns it into
+    an exception: a run's own handler - Ravex's - is the one that has to take
+    it, so that it stops at a step boundary and saves (GPU-294). Turned into
+    `KeyboardInterrupt` here, Ravex found a handler already in place, stood
+    its own down, and the interrupt could land half way through a step."""
+    import signal
+    import subprocess
+    import sys
+
+    script = tmp_path / "script.py"
+    script.write_text(
+        "import signal\n"
+        "print(signal.getsignal(signal.SIGTERM) is signal.SIG_DFL)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", smith._LAUNCHER, str(script)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "True"
+    if hasattr(signal, "SIGBREAK"):
+        # On Windows a stop is CTRL_BREAK, still turned into an interrupt.
+        assert "SIGBREAK" in smith._LAUNCHER

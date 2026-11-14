@@ -307,11 +307,21 @@ KERNEL_PUSH_EVERY_SECONDS = 900.0
 #: How long a kernel file must have stayed unchanged to be pushed mid-run.
 KERNEL_SETTLED_SECONDS = 120.0
 
-#: Runs the script the way ``python script.py`` would, with one difference: a
-#: stop request arrives as ``KeyboardInterrupt``. On Windows the only signal
-#: one process can send another's group is CTRL_BREAK, whose default is to
-#: end the process on the spot - no final checkpoint, and a status left saying
-#: "running". Turned into an exception, it unwinds through Ravex like Ctrl-C.
+#: Runs the script the way ``python script.py`` would, with one difference on
+#: Windows: a stop request arrives as ``KeyboardInterrupt``. There the only
+#: signal one process can send another's group is CTRL_BREAK, whose default is
+#: to end the process on the spot - no final checkpoint, and a status left
+#: saying "running". Turned into an exception, it unwinds through Ravex like
+#: Ctrl-C.
+#:
+#: **SIGTERM is left alone.** It used to be turned into ``KeyboardInterrupt``
+#: too, and then Ravex found a handler already there and stood its own down,
+#: saying a stop would not save a checkpoint first. The exception arrives
+#: wherever the script is, half way through an optimizer step included, and the
+#: final checkpoint written on the way out could hold weights updated in part.
+#: Ravex's own handler stops at the next step boundary, saves, and ends with
+#: the exit status of a SIGTERM (GPU-294). A script without Ravex is ended by
+#: the signal's default, with no stack trace either.
 #:
 #: Once it has unwound - Ravex's final checkpoint written on the way out - it
 #: ends here with one line, not the stack trace Python would print for it: a
@@ -330,9 +340,8 @@ import os, runpy, signal, sys
 def _stop(*_):
     raise KeyboardInterrupt
 
-for _name in ("SIGBREAK", "SIGTERM"):
-    if hasattr(signal, _name):
-        signal.signal(getattr(signal, _name), _stop)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, _stop)
 
 _ranked = os.environ.pop("SMITH_RANK_LOG", "")
 if _ranked and os.environ.get("LOCAL_RANK", "").isdigit():
