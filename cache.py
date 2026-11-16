@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -94,8 +95,10 @@ import random
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -215,6 +218,72 @@ SIGN_AT_ONCE = 500
 SIGNED_MARGIN = 60.0
 
 
+#: What a request on a kept connection raises when the bucket closed that
+#: connection while it sat idle: nothing says so until the next request.
+_CLOSED_WHILE_IDLE = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, http.client.BadStatusLine)
+
+
+class _KeptConnections:
+    """One open connection per thread and bucket host, reused request after
+    request (GPU-421).
+
+    With the reads signed in batches, Triton's 705 files still took 40-45 s
+    on some nodes and 8 s on others: a new connection per file pays DNS, TCP
+    and TLS before its request, three or four round trips where one would
+    do, and far from the bucket that is most of a second a file. A pull's
+    transfers each keep theirs, so the rest is one round trip a file.
+
+    A connection the bucket closed while idle fails on its next request; that
+    request goes again on a new connection, once. A new one that fails is a
+    real failure and is raised.
+    """
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _held(self) -> Dict[Tuple[str, str], http.client.HTTPConnection]:
+        held = getattr(self._local, "held", None)
+        if held is None:
+            held = self._local.held = {}
+        return held
+
+    def _drop(self, where: Tuple[str, str]) -> None:
+        connection = self._held().pop(where, None)
+        if connection is not None:
+            connection.close()
+
+    def send(self, method: str, url: str, body: Optional[bytes] = None,
+             headers: Optional[Dict[str, str]] = None) -> Tuple[int, bytes]:
+        """``method`` on ``url``, a URL the service signed; its status and body."""
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in ("https", "http"):
+            raise ValueError("a signed URL is http or https, not %r" % parts.scheme)
+        target = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        where = (parts.scheme, parts.netloc)
+        while True:
+            held = self._held()
+            connection = held.get(where)
+            fresh = connection is None
+            if connection is None:
+                kind = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+                connection = held[where] = kind(parts.netloc, timeout=SIGNED_TIMEOUT)
+            try:
+                connection.request(method, target, body=body, headers=headers or {})
+                response = connection.getresponse()
+                data = response.read()
+            except _CLOSED_WHILE_IDLE:
+                self._drop(where)
+                if fresh:
+                    raise
+                continue
+            except BaseException:
+                self._drop(where)
+                raise
+            if response.will_close:
+                self._drop(where)
+            return response.status, data
+
+
 class SignedStore:
     """A store whose every operation a service signs (see the module's
     docstring): no bucket key on this machine, only ``token`` for the service.
@@ -223,6 +292,8 @@ class SignedStore:
     def __init__(self, address: str, token: str) -> None:
         self.address = address
         self.token = token
+        #: The connections to the bucket the signed URLs point at (GPU-421).
+        self._bucket = _KeptConnections()
         #: Reads signed ahead by :meth:`sign_reads`: path -> (URL, when it is
         #: no longer to be used, by ``time.monotonic``).
         self._signed: Dict[str, Tuple[str, float]] = {}
@@ -294,29 +365,24 @@ class SignedStore:
         return self._url("get", path)
 
     def get(self, path: str) -> Optional[bytes]:
-        request = urllib.request.Request(self._read_url(path), headers={"User-Agent": "smith"})
-        try:
-            with urllib.request.urlopen(request, timeout=SIGNED_TIMEOUT) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return None
-            raise OSError("get %s: %d" % (path, exc.code)) from None
+        status, data = self._bucket.send("GET", self._read_url(path), headers={"User-Agent": "smith"})
+        if status == 404:
+            return None
+        if not 200 <= status < 300:
+            raise OSError("get %s: %d" % (path, status))
+        return data
 
     def put(self, path: str, data: bytes) -> None:
-        request = urllib.request.Request(
+        status, _ = self._bucket.send(
+            "PUT",
             self._url("put", path, len(data)),
-            data=data,
-            method="PUT",
-            # The presigned URL signs the host alone; a content type is
-            # still sent, or urllib would send a form's.
+            body=data,
+            # The presigned URL signs the host alone; the content type says
+            # what the bytes are, for whoever reads the bucket.
             headers={"User-Agent": "smith", "Content-Type": "application/octet-stream"},
         )
-        try:
-            with urllib.request.urlopen(request, timeout=SIGNED_TIMEOUT):
-                pass
-        except urllib.error.HTTPError as exc:
-            raise OSError("put %s: %d" % (path, exc.code)) from None
+        if not 200 <= status < 300:
+            raise OSError("put %s: %d" % (path, status))
 
     def list(self, prefix: str) -> List[str]:
         paths = self._ask("list", prefix).get("paths")

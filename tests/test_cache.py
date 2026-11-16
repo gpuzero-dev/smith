@@ -177,10 +177,22 @@ class SigningService:
         self.asked = []
         #: How long a signed URL lives, as the service says.
         self.expires = 600
+        #: The client end of every connection a read or write of an object
+        #: came in on: one per connection, however many requests it carried.
+        self.object_connections = set()
+        #: When set, a connection is closed after each object it served,
+        #: without saying so in the answer: what a bucket does to a kept
+        #: connection that sat idle past its patience.
+        self.drop_kept = False
         self.lock = threading.Lock()
         service = self
 
         class Handler(BaseHTTPRequestHandler):
+            # A bucket speaks HTTP/1.1 and keeps a connection open between
+            # requests; HTTP/1.0, the default here, would close each one and
+            # hide whether a pull reuses them (GPU-421).
+            protocol_version = "HTTP/1.1"
+
             def log_message(self, *args):
                 pass
 
@@ -229,6 +241,10 @@ class SigningService:
 
             def _object(self):
                 service.object_auth.append(self.headers.get("Authorization"))
+                with service.lock:
+                    service.object_connections.add(self.client_address)
+                if service.drop_kept:
+                    self.close_connection = True
                 return urllib.parse.unquote(self.path[len("/objects/"):])
 
             def do_GET(self):
@@ -440,6 +456,43 @@ def test_a_pull_of_many_files_asks_for_their_signatures_in_batches(tmp_path, mon
     assert _read(second) == files
     assert service.asked.count("get_many") == 3  # 10 reads, 4 to a batch
     assert service.asked.count("get") == 1  # key.json alone
+
+
+def test_a_pull_reuses_its_connections_to_the_bucket(tmp_path, monkeypatch, service):
+    """GPU-421: with the signatures in batches, Triton's 705 files still took
+    40-45 s on some nodes and 8 s on others. A new connection per file pays
+    DNS, TCP and TLS before its request, three or four round trips where one
+    would do, and far from the bucket that is most of a second a file. Each
+    transfer keeps its connection, so a pull opens one per transfer and one
+    for the key, not one per file."""
+    monkeypatch.setattr(_cache, "gpu_capabilities", lambda: ["sm_89"])
+    monkeypatch.setattr(_cache, "TRANSFERS", 3)
+    monkeypatch.setenv("SMITH_CACHE_TOKEN", service.token)
+    first, second = str(tmp_path / "first"), str(tmp_path / "second")
+    files = {"k%d.cubin" % index: b"kernel %d" % index for index in range(12)}
+    _fill(first, files)
+    store = "sign+%s/sign" % service.url
+    assert main(["push", "--name", "triton", "--dir", first, "--store", store]) == 0
+
+    service.object_connections.clear()
+    assert main(["pull", "--name", "triton", "--dir", second, "--store", store]) == 0
+
+    assert _read(second) == files
+    assert len(service.object_connections) <= 3 + 1
+
+
+def test_a_kept_connection_the_bucket_closed_is_opened_again(service):
+    """A bucket closes a connection that sat idle, and says nothing until the
+    next request on it fails. That request goes again on a new connection
+    rather than failing the pull."""
+    service.objects["a/b"] = b"one"
+    service.objects["a/c"] = b"two"
+    service.drop_kept = True
+    store = _cache.SignedStore(service.url + "/sign", service.token)
+    assert store.get("a/b") == b"one"
+    assert store.get("a/c") == b"two"
+    store.put("a/d", b"three")
+    assert service.objects["a/d"] == b"three"
 
 
 def test_a_read_signed_too_long_ago_is_signed_again_alone(service):
