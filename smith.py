@@ -184,6 +184,7 @@ import argparse
 import http.client
 import json
 import os
+import random
 import re
 import signal
 import socket
@@ -237,6 +238,9 @@ LOG_READ = 1 << 20
 #: ``print`` on the node should be on the page within a second or two, and
 #: a read with nothing new costs no call (GPU-178).
 LOG_SECONDS = 0.5
+
+#: The longest between two polls of a backend that does not answer.
+POLL_MOST_SECONDS = 30.0
 
 #: The longest the output waits between two tries while the backend takes none.
 LOGS_WAIT_MOST = 30.0
@@ -1722,12 +1726,15 @@ class Agent:
         #: machine back. An event and not a call into the job: the main loop
         #: is the only one that touches the process.
         self.reclaimed = threading.Event()
+        #: Whether the jobs an earlier start of this agent left running have
+        #: been closed; none is taken before, or its own would be among them.
+        self.reconciled = False
         self.spot: Optional[SpotWatcher] = None
 
     def takes_jobs(self) -> bool:
         """Whether to claim a job: not with a fault, and not on a machine
         that is about to go, where it would start work to lose."""
-        return self.fault is None and not self.reclaimed.is_set()
+        return self.fault is None and not self.reclaimed.is_set() and self.reconciled
 
     def start_spot_watch(self) -> None:
         self.spot = SpotWatcher(self.on_spot_notice)
@@ -2077,22 +2084,29 @@ class Agent:
                 self.report(job_id, state, message, run_id)
                 return
             except Unreachable:
-                time.sleep(POLL_SECONDS * 2)
+                pass
             except Refusal as exc:
-                if state != INTERRUPTED or exc.status >= 500:
-                    if state == INTERRUPTED:
-                        # A backend failing for a moment, as during a deploy:
-                        # the same word again, not a different one.
-                        time.sleep(POLL_SECONDS * 2)
-                        continue
-                    raise
-                if exc.status not in (400, 422):
-                    raise
-                # A backend older than this state refuses it (a 400, or a 422
-                # from its validation), and asking again would be refused for
-                # ever: the job ended, and that is what it is told.
-                log("job %d: the backend does not take %r (%s); reporting it failed" % (job_id, state, exc))
-                state = "failed"
+                if exc.status < 500:
+                    if state != INTERRUPTED or exc.status not in (400, 422):
+                        raise
+                    # A backend older than this state refuses it (a 400, or
+                    # a 422 from its validation), and asking again would be
+                    # refused for ever: the job ended, and that is what it
+                    # is told.
+                    log("job %d: the backend does not take %r (%s); reporting it failed" % (job_id, state, exc))
+                    state = "failed"
+                    continue
+                # A backend failing for a moment, as during a deploy: the
+                # same word again, whatever the word. Raised, a job that had
+                # finished stayed "running" on the backend for good, since
+                # nothing here would say it again (GPU-474).
+            if self.alone():
+                # Nobody to tell for longer than this agent waits: the loop
+                # gives the machine back, and the backend's reaper finds the
+                # node gone and settles the job.
+                log("job %d: the backend never heard it %s" % (job_id, state))
+                return
+            time.sleep(POLL_SECONDS * 2)
 
     def reconcile(self) -> None:
         """Close the jobs the backend still thinks this agent is running.
@@ -2105,8 +2119,15 @@ class Agent:
         """
         try:
             jobs = self.backend.call("GET", "/api/jobs") or []
-        except (Unreachable, RuntimeError):
+        except (Unreachable, RuntimeError) as exc:
+            # Asked again at the next poll, and no job is taken until it has
+            # been answered (GPU-474): asked once, an agent that started
+            # while the backend was away left those jobs running for ever.
+            # A refusal is an answer, and asking again would get the same.
+            if isinstance(exc, Refusal) and exc.status < 500:
+                self.reconciled = True
             return
+        self.reconciled = True
         for job in jobs:
             held = job.get("state") in ("claimed", "running") or (
                 job.get("state") == "cancelled" and job.get("finished_at") is None
@@ -2146,19 +2167,25 @@ class Agent:
         self.reconcile()
         self.start_spot_watch()
         polled = 0.0
+        #: How long until the next poll: POLL_SECONDS while the backend
+        #: answers, longer each time it does not.
+        every = POLL_SECONDS
         while True:
             # Before the heartbeat: it needs no answer from the backend to
             # start, and it is exactly the work to do while there is none.
             self.send_logs()
-            if time.monotonic() - polled < POLL_SECONDS:
+            self.keep_stopping()
+            if time.monotonic() - polled < every:
                 # The output every half second, everything else every poll.
                 time.sleep(LOG_SECONDS)
                 continue
             polled = time.monotonic()
             self.ship()
-            self.keep_stopping()
             try:
                 self.beat()
+                every = POLL_SECONDS
+                if not self.reconciled:
+                    self.reconcile()
                 if self.current is None:
                     # None taken on a machine that is going, or with a
                     # fault: the loop still beats, sends logs and serves a
@@ -2168,12 +2195,25 @@ class Agent:
                 else:
                     self.watch()
             except Unreachable:
-                pass
+                # Not every two seconds while it is away, nor all at the
+                # same moment when it is back: hundreds of nodes asking in
+                # step is what keeps a backend that just restarted down
+                # (GPU-474).
+                every = backoff(every)
             except RuntimeError as exc:
                 log(str(exc))
+                if isinstance(exc, Refusal) and exc.status >= 500:
+                    every = backoff(every)
             if self.alone():
                 self.give_up()
             time.sleep(LOG_SECONDS)
+
+
+def backoff(every: float) -> float:
+    """The wait after ``every`` while the backend does not answer: doubled,
+    at most :data:`POLL_MOST_SECONDS`, and spread by half either way so the
+    agents of a fleet do not come back together."""
+    return min(POLL_MOST_SECONDS, every * 2) * random.uniform(0.5, 1.5)
 
 
 class Terminated(BaseException):

@@ -322,3 +322,51 @@ def test_a_stop_goes_on_without_the_backend():
     agent.keep_stopping()
     agent.keep_stopping()
     assert stops == [smith.RECLAIMED, smith.CANCELLED]
+
+
+def test_the_end_of_a_job_is_said_again_through_a_backend_that_is_failing(monkeypatch):
+    """A 502 during a deploy on "finished" was raised, and the job stayed
+    "running" on the backend for good (GPU-474)."""
+    agent = _agent()
+    said = []
+
+    def report(job_id, state, message=None, run_id=None):
+        said.append(state)
+        if len(said) < 3:
+            raise smith.Refusal("PATCH /api/jobs/1: 502", 502)
+        return {}
+
+    monkeypatch.setattr(agent, "report", report)
+    monkeypatch.setattr(smith.time, "sleep", lambda _seconds: None)
+    agent._report_until_heard(1, "finished", None, "r-001")
+    assert said == ["finished", "finished", "finished"]
+    # A refusal of what was said is still raised: asking again changes nothing.
+    monkeypatch.setattr(agent, "report", lambda *a, **k: (_ for _ in ()).throw(smith.Refusal("404", 404)))
+    with pytest.raises(smith.Refusal):
+        agent._report_until_heard(1, "finished", None, "r-001")
+
+
+def test_no_job_is_taken_until_the_old_ones_are_closed(monkeypatch):
+    """Asked once, at a start the backend missed, the jobs an earlier start
+    left were never closed (GPU-474)."""
+    agent = _agent()
+    answers = [smith.Unreachable("down"), []]
+
+    def call(method, path, body=None):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(agent.backend, "call", call)
+    agent.reconcile()
+    assert not agent.reconciled and not agent.takes_jobs()
+    agent.reconcile()
+    assert agent.reconciled and agent.takes_jobs()
+
+
+def test_a_backend_that_is_away_is_asked_less_often_and_not_in_step():
+    waits = [smith.backoff(smith.POLL_SECONDS) for _ in range(50)]
+    assert all(smith.POLL_SECONDS <= wait <= 3 * smith.POLL_SECONDS * 2 / 2 for wait in waits)
+    assert len(set(waits)) > 1
+    assert smith.backoff(10_000.0) <= smith.POLL_MOST_SECONDS * 1.5
