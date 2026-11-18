@@ -100,7 +100,10 @@ JSON over HTTP, with `Authorization: Bearer <SMITH_TOKEN>` when a token is set:
 
 A claimed job may carry `secrets`, an object of names and values - an
 `HF_TOKEN`, a W&B key. smith puts them in that job's process environment only,
-never its own, and never one named `RAVEX_*`, `SMITH_*` or `MOONCLIP_*`; and it replaces
+never its own, and never one named `RAVEX_*`, `SMITH_*` or `MOONCLIP_*`, nor one
+the loader, Python or git read as code to load or run (`LD_*`, `DYLD_*`,
+`PYTHON*`, `GIT_*`, `PATH`, `HOME`, `BROWSER`, `BASH_ENV`, `ENV`, `IFS`): a
+secret under such a name is dropped, and the log says so. It replaces
 their values with `[secret NAME]` in the output lines and failure messages it
 sends back.
 
