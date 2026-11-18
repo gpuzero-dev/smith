@@ -36,3 +36,7 @@ metrics_cost = { path = "/app/bench/metrics_cost.py", params = { steps = 600 } }
 # CUDA, and ravex's TileLang kernel - after checking the kernel writes the
 # torch path's bytes (GPU-139). Prints CHECK OK or CHECK FAILED first.
 quant_cost = { path = "/app/bench/quant_cost.py", params = { elements = 67108864, repeat = 3 } }
+# What the default pre-training metrics cost a 1B decoder's step on this card
+# (GPU-436): trained with nothing but the decorator, in the job's own run, so
+# its metrics page shows them too. Needs a card with about 40 GB.
+pretraining_cost = { path = "/app/bench/pretraining_cost.py", params = { steps = 300 } }
