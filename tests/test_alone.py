@@ -207,3 +207,14 @@ def test_the_provider_is_told_by_its_own_variables(monkeypatch):
     agent.end_machine()
     assert asked[-1][0] == "RunPod pod" and asked[-1][2] == "rk"
     assert asked[-1][1][0].endswith("/pods/pod1")
+
+
+def test_a_secret_is_never_a_name_this_machine_reads_as_code():
+    """LD_PRELOAD or PYTHONPATH as a secret's name is a command on a machine
+    that runs only its own scripts (GPU-463)."""
+    kept = smith.job_secrets({"id": 1, "secrets": {
+        "HF_TOKEN": "h", "WANDB_API_KEY": "w", "GITHUB_TOKEN": "g",
+        "LD_PRELOAD": "/tmp/x.so", "PYTHONPATH": "/tmp", "pythonwarnings": "x", "GIT_CONFIG_PARAMETERS": "x",
+        "PATH": "/tmp", "BROWSER": "sh -c x", "SMITH_TOKEN": "t", "MOONCLIP_S3_BUCKET": "b",
+    }})
+    assert kept == {"HF_TOKEN": "h", "WANDB_API_KEY": "w", "GITHUB_TOKEN": "g"}

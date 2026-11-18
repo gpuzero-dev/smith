@@ -1018,20 +1018,38 @@ def redact(text: str, secrets: Dict[str, str]) -> str:
     return text
 
 
+#: The names a job's secret may not have (:func:`job_secrets`): smith's own
+#: and its libraries' settings, and what the dynamic loader, Python and git
+#: take as code to load or commands to run.
+SECRET_PREFIXES_NOT_TAKEN = ("RAVEX_", "SMITH_", "MOONCLIP_", "PYTHON", "LD_", "DYLD_", "GIT_")
+SECRET_NAMES_NOT_TAKEN = frozenset({"PATH", "HOME", "BROWSER", "BASH_ENV", "ENV", "IFS"})
+
+
 def job_secrets(job: Dict[str, Any]) -> Dict[str, str]:
     """The secrets a backend gave this job: names and values for its
     process's environment. A name smith sets itself, or one the libraries
     under the run read their settings from, is dropped rather than let a
     secret replace the run's own settings: a ``MOONCLIP_S3_*`` secret would
-    send the run's checkpoints to another bucket."""
+    send the run's checkpoints to another bucket.
+
+    So is a name the loader, the interpreter or git reads as what to run
+    (GPU-463): ``LD_PRELOAD``, ``PYTHONPATH``, ``GIT_CONFIG_PARAMETERS``,
+    ``PATH``. A secret is a value somebody typed into a backend; under one of
+    those names it is code on this machine, which runs only the scripts its
+    config names unless it said otherwise (``code``). Each one dropped is
+    said, so a job that misses it is not a mystery."""
     given = job.get("secrets")
     if not isinstance(given, dict):
         return {}
-    return {
-        str(name): str(value)
-        for name, value in given.items()
-        if not str(name).startswith(("RAVEX_", "SMITH_", "MOONCLIP_"))
-    }
+    kept = {}
+    for name, value in given.items():
+        name = str(name)
+        if name.upper().startswith(SECRET_PREFIXES_NOT_TAKEN) or name.upper() in SECRET_NAMES_NOT_TAKEN:
+            log("job %s: the secret %s is not put in its environment: the name is one this machine reads" % (
+                job.get("id"), name))
+            continue
+        kept[name] = str(value)
+    return kept
 
 
 class Screen:
