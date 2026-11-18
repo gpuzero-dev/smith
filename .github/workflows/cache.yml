@@ -26,9 +26,10 @@ name: Cache
 #
 # Secrets: SMITH_BACKEND, the backend's address, and SMITH_BUILDER_TOKEN, its
 # builder token. Without them (a fork) each job says so and does nothing.
-# They live in the `production` environment, which only main can enter,
-# rather than among the repository's secrets, which a workflow on any branch
-# can read: anyone who could push a branch could otherwise print them.
+# They live in the `production` environment, which only main and deploy can
+# enter, both of which only the owner can update, rather than among the
+# repository's secrets, which a workflow on any branch can read: anyone who
+# could push a branch could otherwise print them (GPU-412).
 
 on:
   schedule:

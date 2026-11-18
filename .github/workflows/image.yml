@@ -15,9 +15,16 @@ on:
   push:
     branches: [deploy]
 
+# The repository's own token only reads the registry: the smith-gpu package
+# gives this repository the read role, not write (GPU-412). Anyone with write
+# access to the repository can push a branch whose workflow asks the token for
+# packages: write, and with the write role that branch could replace the
+# `latest` every node starts from. The push below uses GHCR_TOKEN instead, a
+# secret of the `production` environment, which only main and deploy enter and
+# only the owner can update.
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 # Two pushes to deploy each get their image; neither is cancelled halfway,
 # which would leave a tag that does not exist after a push that said it would.
@@ -27,6 +34,7 @@ concurrency:
 
 jobs:
   gpu:
+    environment: production
     runs-on: ubuntu-latest
     steps:
       # torch with its CUDA libraries does not fit beside what the runner
@@ -38,7 +46,7 @@ jobs:
           df -h /
       # Every action is pinned to a commit, its tag beside it: a tag can be
       # moved by whoever controls the action, and this job may publish the
-      # image every node starts from (packages: write). Moving to a newer
+      # image every node starts from (GHCR_TOKEN). Moving to a newer
       # release is a change of the pin, made on purpose.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Tag
@@ -51,7 +59,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_TOKEN }}
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
