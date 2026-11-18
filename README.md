@@ -41,7 +41,13 @@ The GPU image is published by pushing to the `deploy` branch
 (`git push origin main:deploy`): `.github/workflows/image.yml` builds it from
 PyPI and pushes it as `ghcr.io/<owner>/smith-gpu:<commit>`, smith's short
 commit, and as `:latest`, then checks both tags are in the registry and that
-no layer is over 250 MB.
+no layer is over 250 MB. Last, it tells the backend which bytes it pushed:
+`POST /api/agent-image` with `Authorization: Bearer <SMITH_BUILDER_TOKEN>`
+and `{"digest": "sha256:...", "commit": "<smith's commit>"}`. A backend
+should start nodes from that digest, not from a tag: anyone who can push a
+branch of this repository can run a workflow that rewrites a tag in the
+registry, while the builder's token is a secret of the `production`
+environment, which only `main` and `deploy` enter.
 
 **The GPU image does not carry torch.** torch with its CUDA libraries is
 about 7 GB, and a host's docker that drops a layer pulls it again from its

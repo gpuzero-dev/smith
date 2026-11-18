@@ -7,24 +7,24 @@ name: GPU image
 #
 # Two tags: smith's commit, which says exactly what is in the image (the
 # libraries are pinned in Dockerfile.gpu, so the commit decides it all), and
-# `latest`, which a backend can name once and never change again: the deploy
-# branch is the deliberate step, so the newest image it published is the one
-# to start nodes with.
+# `latest`, for a person who wants the newest by hand.
+#
+# Neither is what a backend starts nodes from: its digest is (GPU-412). This
+# is a public repository whose collaborators can push branches, and a
+# workflow on any branch can ask the repository's token for packages: write,
+# so a tag in the registry is anyone's with write access here. The last step
+# tells the backend the digest it pushed, with the builder's token, a secret
+# of the `production` environment, which only main and deploy enter and only
+# the owner can update: a branch can rewrite `latest`, never which bytes a
+# node runs.
 
 on:
   push:
     branches: [deploy]
 
-# The repository's own token only reads the registry: the smith-gpu package
-# gives this repository the read role, not write (GPU-412). Anyone with write
-# access to the repository can push a branch whose workflow asks the token for
-# packages: write, and with the write role that branch could replace the
-# `latest` every node starts from. The push below uses GHCR_TOKEN instead, a
-# secret of the `production` environment, which only main and deploy enter and
-# only the owner can update.
 permissions:
   contents: read
-  packages: read
+  packages: write
 
 # Two pushes to deploy each get their image; neither is cancelled halfway,
 # which would leave a tag that does not exist after a push that said it would.
@@ -46,7 +46,7 @@ jobs:
           df -h /
       # Every action is pinned to a commit, its tag beside it: a tag can be
       # moved by whoever controls the action, and this job may publish the
-      # image every node starts from (GHCR_TOKEN). Moving to a newer
+      # image every node starts from (packages: write). Moving to a newer
       # release is a change of the pin, made on purpose.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Tag
@@ -59,9 +59,10 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        id: build
         with:
           context: .
           file: Dockerfile.gpu
@@ -105,5 +106,21 @@ jobs:
           print("%7.1f MB  in all" % (total / 1e6))
           big = [layer for layer in layers if layer["size"] > limit]
           sys.exit("%d layer(s) over 250 MB" % len(big) if big else 0)'
+      # Last, after every check: a backend starts nodes from this digest as
+      # soon as it is told, so an image that failed one is never told.
+      - name: Tell the backend the digest
+        env:
+          SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
+          SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          if [ -z "$SMITH_BACKEND" ] || [ -z "$SMITH_BUILDER_TOKEN" ]; then
+            echo "No SMITH_BACKEND or SMITH_BUILDER_TOKEN: no backend will start nodes from this image." >&2
+            exit 1
+          fi
+          body=$(printf '{"digest": "%s", "commit": "%s"}' "$DIGEST" "$GITHUB_SHA")
+          curl -sSf -X POST "${SMITH_BACKEND%/}/api/agent-image" \
+            -H "Authorization: Bearer $SMITH_BUILDER_TOKEN" -H "Content-Type: application/json" \
+            -d "$body" > /dev/null
       - name: Summary
-        run: echo "Pushed \`${{ steps.tag.outputs.image }}\`, now also \`latest\`" >> "$GITHUB_STEP_SUMMARY"
+        run: echo "Pushed \`${{ steps.tag.outputs.image }}\` (\`${{ steps.build.outputs.digest }}\`), now also \`latest\`; nodes start from the digest" >> "$GITHUB_STEP_SUMMARY"
