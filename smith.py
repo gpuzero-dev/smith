@@ -85,7 +85,12 @@ printed by the script is replaced by its name before it leaves the machine.
 **Stopping.** A job cancelled on the backend is noticed at the next report, and
 the process is interrupted the way Ctrl-C would: Ravex sees a
 ``KeyboardInterrupt``, writes its final checkpoint and records the run as
-``interrupted``. One that has not exited a minute later is killed.
+``interrupted``. One that has not exited a minute later is killed. - its whole
+process group, with or without a backend to hear of it. The agent stops its
+job the same way, and waits for it, when it is itself told to stop
+(``SIGTERM``: ``docker stop``, a machine being given back): the job is in a
+process group of its own, and would otherwise die with the container, its
+last checkpoint unwritten.
 
 **A bucket without keys (GPU-331).** A job's storage on AWS may come with a
 region and no keys: the node's instance role writes the bucket, and the run is
@@ -232,6 +237,9 @@ LOG_READ = 1 << 20
 #: ``print`` on the node should be on the page within a second or two, and
 #: a read with nothing new costs no call (GPU-178).
 LOG_SECONDS = 0.5
+
+#: The longest the output waits between two tries while the backend takes none.
+LOGS_WAIT_MOST = 30.0
 
 TIMEOUT = 10.0
 
@@ -723,7 +731,13 @@ class Config:
             hardware=str(env("SMITH_HARDWARE") or raw.get("hardware", "local-cpu")),
             gpus=max(1, int(env("SMITH_GPUS") or raw.get("gpus", 1))),
             runs=resolve(raw.get("runs", "runs")),
-            python=raw.get("python") or sys.executable,
+            # A path is the file's, like every other in it; a bare name
+            # (``python3``) is the PATH's to find.
+            python=(
+                resolve(raw["python"])
+                if raw.get("python") and (os.sep in raw["python"] or "/" in raw["python"])
+                else raw.get("python") or sys.executable
+            ),
             scripts=scripts,
             model_params=model_params,
             params=params,
@@ -1192,18 +1206,27 @@ class LogTail:
             return not full
         for first in range(0, max(len(lines), 1), LOG_BATCH):
             last = first + LOG_BATCH >= len(lines)
-            backend.call(
-                "POST",
-                "/api/jobs/%d/logs" % self.job_id,
-                {
-                    "start": self.line + first,
-                    "lines": lines[first : first + LOG_BATCH],
-                    "rank": self.rank,
-                    # Only with the last batch: until then it is not the line
-                    # after the ones sent.
-                    "partial": partial if last else None,
-                },
-            )
+            try:
+                backend.call(
+                    "POST",
+                    "/api/jobs/%d/logs" % self.job_id,
+                    {
+                        "start": self.line + first,
+                        "lines": lines[first : first + LOG_BATCH],
+                        "rank": self.rank,
+                        # Only with the last batch: until then it is not the line
+                        # after the ones sent.
+                        "partial": partial if last else None,
+                    },
+                )
+            except Refusal as refused:
+                if refused.status not in NEVER_TAKEN:
+                    raise
+                # Sent again it is refused again: the same megabyte, twice a
+                # second, for as long as the job runs, and nothing after it
+                # ever arrives (GPU-466). Passed by, and said once a batch.
+                log("job %d: the backend will not take %d line(s) of output (%d); passed by" % (
+                    self.job_id, len(lines[first : first + LOG_BATCH]), refused.status))
         self.offset += end
         self.line += len(lines)
         self.screen = screen
@@ -1211,10 +1234,27 @@ class LogTail:
         return not full
 
 
+#: The backend's answers to a batch of output that the same batch will get
+#: again: a job that is not there, lines it cannot read, a body too large.
+NEVER_TAKEN = (400, 404, 410, 413, 422)
+
+
 class Running:
     """A job this agent started, and the process carrying it out."""
 
     def __init__(self, job: Dict[str, Any], config: Config) -> None:
+        #: The rendezvous this agent serves for the run, if it hosts it.
+        self.rendezvous: Optional[subprocess.Popen] = None
+        try:
+            self._start(job, config)
+        except BaseException:
+            # Started before the script, which dials it: a job that then
+            # cannot start - a parameter that is no flag's name - left it
+            # listening on the run's port with nobody to stop it (GPU-466).
+            self.stop_rendezvous()
+            raise
+
+    def _start(self, job: Dict[str, Any], config: Config) -> None:
         self.job = job
         self.id = int(job["id"])
         self.stop_requested_at: Optional[float] = None
@@ -1246,8 +1286,6 @@ class Running:
         token = str(outer.get("token") or "")
         if token:
             env["RAVEX_JOB_TOKEN"] = token
-        #: The rendezvous this agent serves for the run, if it hosts it.
-        self.rendezvous: Optional[subprocess.Popen] = None
         # The bucket this job's store goes to: the one the backend handed with
         # it - the job's owner's own - or else this agent's.
         own = Bucket.from_job(job["storage"]) if job.get("storage") else None
@@ -1666,6 +1704,10 @@ class Agent:
         #: The output of every job still being sent: the running one, and any
         #: that ended while the backend was not answering.
         self.tails: List[LogTail] = []
+        #: After a batch of output the backend did not take: how long the
+        #: next try waits, doubled each time, and until when.
+        self.logs_wait = 0.0
+        self.logs_after = 0.0
         #: `ravex ship` reads the token from here, not from its command line,
         #: where any user of the machine can see it.
         self._ship_env = dict(os.environ)
@@ -1715,18 +1757,7 @@ class Agent:
             "the backend has not answered for %.0f minutes; stopping and giving this machine back"
             % (self.backend.silent_for() / 60)
         )
-        running = self.current
-        if running is not None:
-            running.stop(ALONE)
-            while running.process.poll() is None:
-                time.sleep(LOG_SECONDS)
-                # A second call kills a job still there after the grace.
-                running.stop(ALONE)
-            running.close()
-            log("job %d stopped" % running.id)
-        for serving in (self.serving, running):
-            if serving is not None and getattr(serving, "rendezvous", None) is not None:
-                serving.stop_rendezvous()
+        self.stop_job(ALONE)
         self.end_machine()
         raise SystemExit(ALONE_EXIT)
 
@@ -1942,18 +1973,55 @@ class Agent:
             if answer.get("state") == "cancelled":
                 running.stop()
 
+    def keep_stopping(self) -> None:
+        """What stopping a job needs of this machine alone: the provider's
+        notice that the machine is going, and the kill once the grace is
+        over. Before the heartbeat and whatever it answers (GPU-466): both
+        waited on a backend that answered, so with the backend down a spot
+        notice stopped nothing, and a job that ignored its interrupt was
+        never killed."""
+        running = self.current
+        if running is None or running.process.poll() is not None:
+            return
+        if self.reclaimed.is_set() and running.stop_requested_at is None:
+            running.stop(RECLAIMED)
+        elif running.stop_requested_at is not None:
+            running.stop(running.stop_reason)
+
+    def stop_job(self, reason: str) -> None:
+        """Stop the job as a cancel stops it, and wait for it: Ravex writes
+        its last checkpoint to the bucket, which needs no backend."""
+        running = self.current
+        if running is not None:
+            running.stop(reason)
+            while running.process.poll() is None:
+                time.sleep(LOG_SECONDS)
+                # A second call kills a job still there after the grace.
+                running.stop(reason)
+            running.close()
+            log("job %d stopped" % running.id)
+        for serving in (self.serving, running):
+            if serving is not None and getattr(serving, "rendezvous", None) is not None:
+                serving.stop_rendezvous()
+
     def send_logs(self) -> None:
         """Send what the jobs printed since the last time; drop a finished
         job's output once all of it has arrived."""
+        if time.monotonic() < self.logs_after:
+            return
         for tail in list(self.tails):
             try:
                 caught_up = tail.send(self.backend)
             except (Unreachable, RuntimeError):
                 # Kept where it was: sent again, with the same line numbers,
-                # when the backend answers.
-                continue
+                # when the backend answers - not twice a second meanwhile,
+                # each time the megabyte it could not take (GPU-466).
+                self.logs_wait = min(LOGS_WAIT_MOST, max(LOG_SECONDS, self.logs_wait * 2))
+                self.logs_after = time.monotonic() + self.logs_wait
+                return
             if caught_up and tail.done:
                 self.tails.remove(tail)
+        self.logs_wait = 0.0
 
     def ship(self) -> None:
         """Send what finished runs left unsent, one store at a time.
@@ -2088,6 +2156,7 @@ class Agent:
                 continue
             polled = time.monotonic()
             self.ship()
+            self.keep_stopping()
             try:
                 self.beat()
                 if self.current is None:
@@ -2107,6 +2176,10 @@ class Agent:
             time.sleep(LOG_SECONDS)
 
 
+class Terminated(BaseException):
+    """SIGTERM reached the agent; raised where it was, out of the loop."""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a backend's training jobs on this machine.")
     parser.add_argument(
@@ -2116,8 +2189,21 @@ def main() -> None:
     )
     args = parser.parse_args()
     agent = Agent(Config.load(args.config))
+
+    def terminated(_signal: int, _frame: Any) -> None:
+        raise Terminated()
+
+    # `docker stop`, or a provider ending the machine: the job is in a
+    # process group of its own, so the signal reaches the agent alone, and
+    # without this the job was killed with its container a moment later,
+    # its last checkpoint unwritten (GPU-466).
+    signal.signal(signal.SIGTERM, terminated)
     try:
         agent.run()
+    except Terminated:
+        log("asked to stop; stopping the job first")
+        agent.stop_job(CANCELLED)
+        raise SystemExit(143)
     except KeyboardInterrupt:
         if agent.current is not None and agent.current.process.poll() is None:
             log("stopping; job %d keeps running as pid %d" % (agent.current.id, agent.current.process.pid))

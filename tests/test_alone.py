@@ -260,3 +260,65 @@ def test_a_job_is_not_given_what_is_the_agents_alone(tmp_path, monkeypatch):
     # The run still reports its metrics with it, and the output never carries it back.
     assert env["RAVEX_METRICS_TOKEN"] == "agent-token"
     assert running.hidden["SMITH_TOKEN"] == "agent-token"
+
+
+def test_output_the_backend_will_never_take_is_passed_by(tmp_path):
+    """Sent again it was refused again, twice a second, and nothing after it
+    ever arrived (GPU-466)."""
+    path = tmp_path / "job.log"
+    path.write_bytes(b"one\ntwo\n")
+    tail = smith.LogTail(7, str(path))
+    asked = []
+
+    class Backend:
+        def call(self, method, url, body=None):
+            asked.append(body["lines"])
+            raise smith.Refusal("POST %s: 422 lines it cannot read" % url, 422)
+
+    assert tail.send(Backend()) is True
+    assert asked == [["one", "two"]]
+    with open(path, "ab") as handle:
+        handle.write(b"three\n")
+
+    class Taking:
+        def call(self, method, url, body=None):
+            asked.append(body["lines"])
+
+    tail.send(Taking())
+    assert asked[-1] == ["three"]
+
+    # A backend that is failing for a moment is another matter: kept, and sent again.
+    class Down:
+        def call(self, method, url, body=None):
+            raise smith.Refusal("POST %s: 502" % url, 502)
+
+    with open(path, "ab") as handle:
+        handle.write(b"four\n")
+    with pytest.raises(smith.Refusal):
+        tail.send(Down())
+    tail.send(Taking())
+    assert asked[-1] == ["four"]
+
+
+def test_a_stop_goes_on_without_the_backend():
+    """The spot notice and the kill after the grace waited on a heartbeat
+    that was answered (GPU-466)."""
+    agent = _agent()
+    stops = []
+
+    class Job:
+        stop_requested_at = None
+        stop_reason = smith.CANCELLED
+        process = type("P", (), {"poll": lambda self: None})()
+
+        def stop(self, reason=smith.CANCELLED):
+            stops.append(reason)
+            self.stop_requested_at = 1.0
+
+    agent.current = Job()
+    agent.keep_stopping()
+    assert stops == []
+    agent.reclaimed.set()
+    agent.keep_stopping()
+    agent.keep_stopping()
+    assert stops == [smith.RECLAIMED, smith.CANCELLED]
