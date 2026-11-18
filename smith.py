@@ -1018,6 +1018,23 @@ def redact(text: str, secrets: Dict[str, str]) -> str:
     return text
 
 
+def _run_name(value: Any) -> str:
+    """``value`` as a run's id, which is a folder's name under this agent's
+    runs and a prefix in its bucket: letters, digits, ``.``, ``-`` and ``_``,
+    and never ``..``. ``../../app/smith`` as a run's id wrote its store over
+    the agent itself (GPU-465)."""
+    name = str(value)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) or ".." in name:
+        raise RuntimeError("%r is not a name a run can have" % name)
+    return name
+
+
+def _inside(root: str, path: str) -> bool:
+    """Whether ``path`` is under ``root``, links and ``..`` resolved."""
+    root, path = os.path.realpath(root), os.path.realpath(path)
+    return path == root or path.startswith(root + os.sep)
+
+
 #: The names a job's secret may not have (:func:`job_secrets`): smith's own
 #: and its libraries' settings, and what the dynamic loader, Python and git
 #: take as code to load or commands to run.
@@ -1233,10 +1250,27 @@ class Running:
         self.rendezvous: Optional[subprocess.Popen] = None
         # The bucket this job's store goes to: the one the backend handed with
         # it - the job's owner's own - or else this agent's.
-        bucket = Bucket.from_job(job["storage"]) if job.get("storage") else config.storage
-        #: Every value the job's output must not carry back: its secrets, and
-        #: its bucket's keys when they came with it.
+        own = Bucket.from_job(job["storage"]) if job.get("storage") else None
+        bucket = own if own is not None else config.storage
+        # What is this agent's alone leaves the job's environment (GPU-465).
+        # Its token, under its own name: the run is given it as
+        # RAVEX_METRICS_TOKEN, where it is needed, and nowhere else. And its
+        # bucket's keys when the job brings a bucket of its own: one that
+        # came without keys is written with the machine's role, and with the
+        # agent's keys still there Moonclip took those instead.
+        env.pop("SMITH_TOKEN", None)
+        if own is not None:
+            for name in ("MOONCLIP_S3_ACCESS_KEY", "MOONCLIP_S3_SECRET_KEY", "MOONCLIP_S3_SESSION_TOKEN"):
+                env.pop(name, None)
+        #: Every value the job's output must not carry back: its secrets, its
+        #: bucket's keys, and this agent's token, which a script that prints
+        #: its environment would otherwise send to whoever reads the logs.
         self.hidden = dict(self.secrets)
+        if config.token:
+            self.hidden["SMITH_TOKEN"] = config.token
+        for name in ("MOONCLIP_S3_ACCESS_KEY", "MOONCLIP_S3_SECRET_KEY", "MOONCLIP_S3_SESSION_TOKEN"):
+            if env.get(name):
+                self.hidden[name] = env[name]
         if token:
             self.hidden["RAVEX_JOB_TOKEN"] = token
         if bucket is not None and bucket.access_key and bucket.secret_key:
@@ -1265,7 +1299,6 @@ class Running:
         self.wheels = os.path.join(config.runs, "_cache", "wheels")
         self.wheels_store = ""
         self.wheels_report = ""
-        own = Bucket.from_job(job["storage"]) if job.get("storage") else None
         if self.code is not None and config.cache_service and config.token:
             signed = "sign+%s/api/cache/" % config.backend
             self.cache_reads = [signed + "global", signed + "workspace"]
@@ -1302,6 +1335,14 @@ class Running:
                             "keeps no bucket" if bucket is None else "keeps its runs in s3://%s" % bucket.bucket,
                         )
                     )
+            elif not _inside(config.runs, source):
+                # A path a backend names is this machine's to bound: anywhere
+                # else a job could read, and a resume write, what is not a
+                # run's (GPU-465).
+                raise RuntimeError(
+                    "the store of run %s is %r, which is not under this agent's runs"
+                    % (job.get("source_run_id"), source)
+                )
             elif not os.path.isdir(source):
                 raise RuntimeError(
                     "the store of run %s is %r, which is not a directory on this machine"
@@ -1310,7 +1351,7 @@ class Running:
         if job["mode"] in ("resume", "update"):
             # The same run carrying on, from its newest checkpoint: the store
             # is the run's own, and Ravex resumes from what is in it.
-            self.run_id = str(job["source_run_id"])
+            self.run_id = _run_name(job["source_run_id"])
             # A node's part of a run on several resumes its own store, inside
             # the run's, as it wrote it: the same member it was.
             mine = [self.member] if self.member else []
@@ -1336,7 +1377,7 @@ class Running:
             # The id the backend chose when the job was queued, so it could
             # point at the run before the run existed. A backend
             # from before that has none, and the agent makes one up.
-            self.run_id = str(job.get("run_ref") or new_run_id())
+            self.run_id = _run_name(job.get("run_ref") or new_run_id())
             where = "%s/%s" % (self.run_id, self.member) if self.member else self.run_id
             store = os.path.join(config.runs, *where.split("/"))
             if bucket is not None:

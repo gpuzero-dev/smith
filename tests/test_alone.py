@@ -218,3 +218,45 @@ def test_a_secret_is_never_a_name_this_machine_reads_as_code():
         "PATH": "/tmp", "BROWSER": "sh -c x", "SMITH_TOKEN": "t", "MOONCLIP_S3_BUCKET": "b",
     }})
     assert kept == {"HF_TOKEN": "h", "WANDB_API_KEY": "w", "GITHUB_TOKEN": "g"}
+
+
+def test_a_runs_id_is_a_folders_name_and_never_a_way_out(tmp_path):
+    """A run's id is a folder under the agent's runs and a prefix in its
+    bucket; ``../../app/smith`` wrote the store over the agent (GPU-465)."""
+    assert smith._run_name("harold-001") == "harold-001"
+    for name in ("../../app/smith", "a/b", "..", "", ".hidden", "a..b", "/etc"):
+        with pytest.raises(RuntimeError, match="not a name a run can have"):
+            smith._run_name(name)
+    runs = tmp_path / "runs"
+    (runs / "harold-001").mkdir(parents=True)
+    assert smith._inside(str(runs), str(runs / "harold-001"))
+    assert not smith._inside(str(runs), str(runs / ".." / "elsewhere"))
+    assert not smith._inside(str(runs), str(tmp_path))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a job is a process group, POSIX's")
+def test_a_job_is_not_given_what_is_the_agents_alone(tmp_path, monkeypatch):
+    """The agent's token under its own name, and its bucket's keys when the
+    job brings a bucket of its own (GPU-465)."""
+    import json
+    import sys
+
+    script = tmp_path / "show.py"
+    script.write_text("import json, os; print(json.dumps(dict(os.environ)))")
+    monkeypatch.setenv("SMITH_TOKEN", "agent-token")
+    monkeypatch.setenv("MOONCLIP_S3_ACCESS_KEY", "agents-key")
+    monkeypatch.setenv("MOONCLIP_S3_SECRET_KEY", "agents-secret")
+    config = smith.Config(backend="http://127.0.0.1:1", name="n", hardware="h", runs=str(tmp_path / "runs"),
+                          python=sys.executable, scripts={"show": str(script)}, token="agent-token")
+    job = {"id": 1, "script": "show", "mode": "fresh", "name": "n", "run_ref": "r-001", "params": {},
+           "storage": {"type": "s3", "bucket": "theirs", "region": "eu-west-1"}}
+    running = smith.Running(job, config)
+    running.process.wait(timeout=60)
+    with open(running.log_path, encoding="utf-8") as handle:
+        env = json.loads(handle.read().strip().splitlines()[-1])
+    assert "SMITH_TOKEN" not in env
+    assert "MOONCLIP_S3_ACCESS_KEY" not in env and "MOONCLIP_S3_SECRET_KEY" not in env
+    assert env["RAVEX_STORAGE_BUCKET"] == "theirs"
+    # The run still reports its metrics with it, and the output never carries it back.
+    assert env["RAVEX_METRICS_TOKEN"] == "agent-token"
+    assert running.hidden["SMITH_TOKEN"] == "agent-token"
