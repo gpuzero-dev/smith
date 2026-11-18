@@ -10,6 +10,7 @@ ALONE_EXIT; and with no such key it only exits, leaving the host to act.
 
 import http.server
 import io
+import os
 import threading
 import time
 import types
@@ -47,6 +48,43 @@ def test_a_5xx_is_silence_and_a_4xx_is_an_answer(monkeypatch):
     with pytest.raises(smith.Refusal):
         backend.call("GET", "/api/jobs")
     assert backend.silent_for() < 5
+
+
+def test_an_answer_that_is_not_json_is_a_backend_that_did_not_answer(monkeypatch):
+    """A proxy's HTML with a 200, or an answer cut short, ended the agent
+    and its job (GPU-453)."""
+    import http.client
+
+    backend = smith.Backend("http://x")
+
+    class Page(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(smith.urllib.request, "urlopen", lambda *_a, **_k: Page(b"<html>Bad gateway</html>"))
+    with pytest.raises(smith.Unreachable):
+        backend.call("GET", "/api/jobs")
+
+    def cut(*_args, **_kwargs):
+        raise http.client.IncompleteRead(b"{")
+
+    monkeypatch.setattr(smith.urllib.request, "urlopen", cut)
+    with pytest.raises(smith.Unreachable):
+        backend.call("GET", "/api/jobs")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX's")
+def test_the_kill_after_the_grace_reaches_the_ranks(monkeypatch):
+    """torchrun's children are in its group, and die with it."""
+    killed = []
+    monkeypatch.setattr(smith.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+    running = smith.Running.__new__(smith.Running)
+    running.process = type("P", (), {"pid": 4242})()
+    running.kill()
+    assert killed == [(4242, smith.signal.SIGKILL)]
 
 
 def test_the_limit_is_off_at_zero_and_counts_minutes():

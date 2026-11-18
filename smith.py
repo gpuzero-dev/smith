@@ -176,6 +176,7 @@ does without adding to it. Python 3.11 or newer, for ``tomllib``.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -964,7 +965,10 @@ class Backend:
                 # proxy says for a backend that has stopped.
                 self.heard_at = time.monotonic()
             raise Refusal("%s %s: %d %s" % (method, path, exc.code, detail), exc.code) from None
-        except (urllib.error.URLError, OSError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+            # An answer that is not JSON, or cut short, is a proxy's page or a
+            # backend going down mid-answer, not an answer: the same as none.
+            # Left to rise it ended the agent, and its job with it (GPU-453).
             if self._down_since is None:
                 self._down_since = time.monotonic()
                 log("backend %s unreachable (%s); jobs already running carry on" % (self.base, exc))
@@ -1476,7 +1480,19 @@ class Running:
                 pass
         elif now - self.stop_requested_at > STOP_GRACE_SECONDS and self.process.poll() is None:
             log("job %d did not stop within %.0fs; killing it" % (self.id, STOP_GRACE_SECONDS))
-            self.process.kill()
+            self.kill()
+
+    def kill(self) -> None:
+        """Kill the job's whole process group, as the interrupt went to it:
+        the process is torchrun, and killing it alone left its ranks alive,
+        holding the GPUs under a job the backend counts as ended (GPU-453)."""
+        try:
+            if os.name == "nt":
+                self.process.kill()
+            else:
+                os.killpg(self.process.pid, signal.SIGKILL)
+        except OSError:
+            pass
 
     def tail(self, lines: int = 6) -> str:
         """The end of the output: on a failure, usually the line that says why.
