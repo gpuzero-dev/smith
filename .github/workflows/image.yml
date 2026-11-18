@@ -13,10 +13,11 @@ name: GPU image
 # is a public repository whose collaborators can push branches, and a
 # workflow on any branch can ask the repository's token for packages: write,
 # so a tag in the registry is anyone's with write access here. The last step
-# tells the backend the digest it pushed, with the builder's token, a secret
+# tells the backend the digest it pushed, with SMITH_IMAGE_TOKEN, a secret
 # of the `production` environment, which only main and deploy enter and only
 # the owner can update: a branch can rewrite `latest`, never which bytes a
-# node runs.
+# node runs. A token of its own, not the cache builder's (GPU-452): the
+# hourly jobs that fill the cache cannot choose the image nodes start from.
 
 on:
   push:
@@ -111,16 +112,16 @@ jobs:
       - name: Tell the backend the digest
         env:
           SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
-          SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
+          SMITH_IMAGE_TOKEN: ${{ secrets.SMITH_IMAGE_TOKEN }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          if [ -z "$SMITH_BACKEND" ] || [ -z "$SMITH_BUILDER_TOKEN" ]; then
-            echo "No SMITH_BACKEND or SMITH_BUILDER_TOKEN: no backend will start nodes from this image." >&2
+          if [ -z "$SMITH_BACKEND" ] || [ -z "$SMITH_IMAGE_TOKEN" ]; then
+            echo "No SMITH_BACKEND or SMITH_IMAGE_TOKEN: no backend will start nodes from this image." >&2
             exit 1
           fi
           body=$(printf '{"digest": "%s", "commit": "%s"}' "$DIGEST" "$GITHUB_SHA")
           curl -sSf -X POST "${SMITH_BACKEND%/}/api/agent-image" \
-            -H "Authorization: Bearer $SMITH_BUILDER_TOKEN" -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $SMITH_IMAGE_TOKEN" -H "Content-Type: application/json" \
             -d "$body" > /dev/null
       - name: Summary
         run: echo "Pushed \`${{ steps.tag.outputs.image }}\` (\`${{ steps.build.outputs.digest }}\`), now also \`latest\`; nodes start from the digest" >> "$GITHUB_STEP_SUMMARY"

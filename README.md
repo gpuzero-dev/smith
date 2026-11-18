@@ -42,12 +42,14 @@ The GPU image is published by pushing to the `deploy` branch
 PyPI and pushes it as `ghcr.io/<owner>/smith-gpu:<commit>`, smith's short
 commit, and as `:latest`, then checks both tags are in the registry and that
 no layer is over 250 MB. Last, it tells the backend which bytes it pushed:
-`POST /api/agent-image` with `Authorization: Bearer <SMITH_BUILDER_TOKEN>`
+`POST /api/agent-image` with `Authorization: Bearer <SMITH_IMAGE_TOKEN>`
 and `{"digest": "sha256:...", "commit": "<smith's commit>"}`. A backend
 should start nodes from that digest, not from a tag: anyone who can push a
 branch of this repository can run a workflow that rewrites a tag in the
-registry, while the builder's token is a secret of the `production`
-environment, which only `main` and `deploy` enter.
+registry, while that token is a secret of the `production` environment,
+which only `main` and `deploy` enter. It is a token of its own, which no
+other workflow is given: what fills the cache cannot choose the bytes nodes
+run.
 
 **The GPU image does not carry torch.** torch with its CUDA libraries is
 about 7 GB, and a host's docker that drops a layer pulls it again from its
@@ -65,12 +67,17 @@ file name; else the index the wheel was resolved from.
 
 **Who fills the cache's `runtime/`.** This repository's
 `.github/workflows/cache.yml`, its `runtime` job: as soon as `image.yml` has
-published an image, then every hour for `:latest` (or by hand, for any
-tag): it takes `runtime.json` out of that image and runs `runtime.py fill`,
+published an image, then every hour (or by hand), for the image nodes start
+from, which the backend names by digest in its answer to
+`POST /api/cache-builds/pending` (`{"queued": <n>, "image": "sha256:..."}`),
+never for a tag: it takes `runtime.json` out of that image and runs `runtime.py fill`,
 which fetches each wheel the cache lacks from its index, checks its sha256
 and uploads it, one at a time. Like the wheel builder, the same workflow's
 `wheels` job, it holds no bucket key, only the secrets `SMITH_BACKEND` and
-`SMITH_BUILDER_TOKEN`; without them it fills nothing. It asks the backend,
+`SMITH_BUILDER_TOKEN`; without them it fills nothing. The `wheels` job
+compiles in that same image, which is given neither: the runner takes the
+build and pushes the wheel the container left, once it has checked that it
+is the package and the version that were asked for. It asks the backend,
 with `Authorization: Bearer <SMITH_BUILDER_TOKEN>`, at
 `POST /api/cache-runtime/sign`:
 `{"op": "list", "path": "runtime/"}` → `{"paths": ["runtime/<wheel>", ...]}`

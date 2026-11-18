@@ -83,6 +83,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -154,11 +155,20 @@ def lock(report_path: str, out_path: str) -> Dict[str, Any]:
     return manifest
 
 
+#: A wheel's file name: no folder, no ``..``, nothing a path could hide in.
+WHEEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+!-]*[.]whl$")
+
+
 def read_manifest(path: str) -> Dict[str, Any]:
     with open(path, encoding="utf-8") as handle:
         manifest = json.load(handle)
     if manifest.get("version") != 1 or not manifest.get("files"):
         raise SystemExit("%s is not a runtime manifest this smith reads" % path)
+    for entry in manifest["files"]:
+        # A name is a path, on this disk and in the cache: a lock out of an
+        # image is read by CI with a token that writes there (GPU-452).
+        if not WHEEL_NAME.match(str(entry.get("name"))):
+            raise SystemExit("%s names a file that is not a wheel's name: %r" % (path, entry.get("name")))
     return manifest
 
 

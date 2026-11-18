@@ -21,6 +21,15 @@ name: Cache
 # every node checks every runtime wheel against the lock's sha256, and fill
 # checks it before uploading too.
 #
+# The image is the one nodes start from, by the digest the backend holds, and
+# never a tag (GPU-452): this is a public repository, and a workflow on any
+# branch its collaborators push can ask the repository's token to write the
+# registry, so `latest` is theirs to rewrite. And nothing that runs in the
+# image is given the token: the build runs an sdist's own setup.py, so the
+# runner takes the build, the container compiles it, and the runner pushes
+# the wheel it left, after checking it is the one asked for (builder.py).
+# Each step that needs the token names it; the others have none.
+#
 # On this repository's runners because they are public ones: 4 CPUs and 16 GB,
 # two nvcc of flash-attn at once, where a private repository's 7 GB holds one.
 #
@@ -35,20 +44,20 @@ on:
   schedule:
     - cron: "17 * * * *"
   # After image.yml, for the runtime only, and only when it pushed: a failed
-  # build published no lock.
+  # build published no lock. It told the backend its digest as its last step,
+  # so the image the backend names by then is the one it published.
   workflow_run:
     workflows: ["GPU image"]
     types: [completed]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Image tag whose runtime to fill: smith's short commit, or latest"
-        required: false
-        default: latest
 
 permissions:
   contents: read
   packages: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   runtime:
@@ -62,48 +71,34 @@ jobs:
     concurrency:
       group: cache-runtime
       cancel-in-progress: false
-    env:
-      SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
-      SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
     steps:
-      - name: Secrets
-        id: secrets
-        run: |
-          if [ -z "$SMITH_BACKEND" ] || [ -z "$SMITH_BUILDER_TOKEN" ]; then
-            echo "No SMITH_BACKEND or SMITH_BUILDER_TOKEN: no runtime to fill." >> "$GITHUB_STEP_SUMMARY"
-            echo "ok=0" >> "$GITHUB_OUTPUT"
-          else
-            echo "ok=1" >> "$GITHUB_OUTPUT"
-          fi
       # The workflow's own commit, which is main's: its runtime.py reads every
       # lock of version 1, an older image's too, which may predate fill.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        if: steps.secrets.outputs.ok == '1'
-      # After image.yml, the image it just published: tagged with the short
-      # commit it was built from, the head of the run that built it. By hand,
-      # the tag asked for; on the hour, latest, which nodes start from.
+      # The digest nodes start from, which the backend holds. Without the
+      # secrets (a fork), or a backend that names none, there is no image.
       - name: Image
         id: image
-        if: steps.secrets.outputs.ok == '1'
         env:
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          TAG: ${{ inputs.tag }}
+          SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
+          SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
         run: |
-          tag="${TAG:-latest}"
-          [ -n "$HEAD_SHA" ] && tag="${HEAD_SHA::7}"
-          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/smith-gpu:$tag" >> "$GITHUB_OUTPUT"
+          python3 builder.py --pending >> "$GITHUB_OUTPUT"
+          grep -q '^image=sha256:' "$GITHUB_OUTPUT" || echo "No image digest from the backend: no runtime to fill." >> "$GITHUB_STEP_SUMMARY"
       # The image is public; logged in anyway, so a private one works the same.
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        if: steps.secrets.outputs.ok == '1'
+        if: steps.image.outputs.image != ''
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       # Only the lock out of the image: about 300 MB pulled, never started.
       - name: Lock
-        if: steps.secrets.outputs.ok == '1'
+        if: steps.image.outputs.image != ''
+        env:
+          DIGEST: ${{ steps.image.outputs.image }}
         run: |
-          id=$(docker create "${{ steps.image.outputs.image }}")
+          id=$(docker create "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/smith-gpu@$DIGEST")
           docker cp "$id:/app/runtime.json" runtime.json
           docker rm "$id" > /dev/null
           python3 -c 'import json; print(len(json.load(open("runtime.json"))["files"]), "wheels in the lock")'
@@ -111,16 +106,20 @@ jobs:
       # holds the largest, about a gigabyte, and needs no room made. The token
       # reaches runtime.py through its environment, never its arguments.
       - name: Fill
-        if: steps.secrets.outputs.ok == '1'
+        if: steps.image.outputs.image != ''
+        env:
+          SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
+          SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
         run: |
-          set -o pipefail
           python3 runtime.py fill --manifest runtime.json \
             --builder "${SMITH_BACKEND%/}/api/cache-runtime/sign" 2>&1 | tee fill.log
       - name: Summary
-        if: always() && steps.secrets.outputs.ok == '1'
+        if: always() && steps.image.outputs.image != ''
+        env:
+          DIGEST: ${{ steps.image.outputs.image }}
         run: |
           {
-            echo "Runtime cache for \`${{ steps.image.outputs.image }}\`:"
+            echo "Runtime cache for \`smith-gpu@$DIGEST\`:"
             echo
             echo '```'
             # Everything but the wheels already there, which are most of them.
@@ -142,16 +141,15 @@ jobs:
     concurrency:
       group: wheels
       cancel-in-progress: false
-    env:
-      SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
-      SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
-      IMAGE: ghcr.io/${{ github.repository_owner }}/smith-gpu:latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Asked before anything heavy: most hours there is nothing to build, and
-      # the image is gigabytes.
+      # the image is gigabytes. The answer names the image too, by digest.
       - name: Anything to build
         id: pending
+        env:
+          SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
+          SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
         run: python3 builder.py --pending >> "$GITHUB_OUTPUT"
       - name: Make room
         if: steps.pending.outputs.pending == '1'
@@ -165,15 +163,41 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # The builder from this checkout, in the image: what builds is this
-      # commit's builder.py, against the Python and torch the nodes have.
-      - name: Build
+      # Pulled before the build is taken: a build claimed and then not built
+      # waits for the backend to queue it again.
+      - name: Pull
         if: steps.pending.outputs.pending == '1'
+        env:
+          DIGEST: ${{ steps.pending.outputs.image }}
+        run: docker pull -q "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/smith-gpu@$DIGEST"
+      - name: Claim
+        id: claim
+        if: steps.pending.outputs.pending == '1'
+        env:
+          SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
+          SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
+        run: python3 builder.py --claim "$RUNNER_TEMP/build.json" >> "$GITHUB_OUTPUT"
+      # The builder from this checkout, in the image: what builds is this
+      # commit's builder.py, against the Python and torch the nodes have. No
+      # token and no backend in there: it reads the build and leaves a wheel.
+      - name: Build
+        if: steps.claim.outputs.claimed == '1'
+        env:
+          DIGEST: ${{ steps.pending.outputs.image }}
         run: |
-          IMAGE="${IMAGE,,}"
-          docker pull -q "$IMAGE"
+          mkdir -p "$RUNNER_TEMP/out"
           # torch first: the image carries only its lock (runtime.py), and a
           # wheel is built against the torch the nodes install from it.
-          docker run --rm -e SMITH_BACKEND -e SMITH_BUILDER_TOKEN \
+          docker run --rm \
             -v "$PWD/builder.py:/builder/builder.py:ro" -v "$PWD/cache.py:/builder/cache.py:ro" \
-            "$IMAGE" sh -c "python /app/smith/runtime.py install --manifest /app/runtime.json && python /builder/builder.py"
+            -v "$RUNNER_TEMP/build.json:/builder/build.json:ro" -v "$RUNNER_TEMP/out:/out" \
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/smith-gpu@$DIGEST" \
+            sh -c "python /app/smith/runtime.py install --manifest /app/runtime.json && python /builder/builder.py --build /builder/build.json --out /out"
+      # Whatever the build did, a claimed build is told to the backend: its
+      # wheel pushed, or why there is none.
+      - name: Finish
+        if: always() && steps.claim.outputs.claimed == '1'
+        env:
+          SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
+          SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
+        run: python3 builder.py --finish "$RUNNER_TEMP/build.json" --out "$RUNNER_TEMP/out"
