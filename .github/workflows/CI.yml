@@ -1,18 +1,33 @@
 name: CI
 
+# Every check of this repository, on any commit anyone pushes or proposes.
+# CD.yml calls it too, on the commit it is about to publish: no image is
+# built and pushed, and no digest reaches the backend, unless it passes
+# (GPU-487, GPU-489).
+
 on:
+  # Not deploy: there CD.yml runs this same CI before it builds the image,
+  # and a second run on the same commit would only spend minutes.
   push:
-    branches: [main]
+    branches-ignore: [deploy]
   pull_request:
-  # image.yml runs it on the commit it builds, before the image is pushed.
+  workflow_dispatch:
+  # CD.yml runs it on the commit it builds, before the image is pushed.
   workflow_call:
 
 # Checks only: the token reads the repository and does nothing else.
 permissions:
   contents: read
 
+# An ordinary run supersedes the one before it on the same ref: only the
+# newest commit's verdict matters. A call from CD.yml is different: inside a
+# called workflow the github context is the caller's, so its ref is deploy
+# and its workflow is "CD", and in the group of an ordinary run on deploy it
+# could cancel that run or be cancelled by it, and a cancelled call is an
+# image never published. So a call gets a group of its own, unique to the CD
+# run (run_id is the caller's too), which nothing else ever joins (GPU-489).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow == 'CI' && format('ci-{0}', github.ref) || format('ci-cd-{0}', github.run_id) }}
   cancel-in-progress: true
 
 jobs:
@@ -69,7 +84,7 @@ jobs:
   image:
     # The CPU image from PyPI: proves the repository builds on its own, without
     # any checkout of the libraries. The GPU image is the same recipe with gigabytes more
-    # torch: it is built and pushed by image.yml, on a push to the deploy branch.
+    # torch: it is built and pushed by CD.yml, on a push to the deploy branch.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

@@ -5,7 +5,7 @@
     python builder.py --build build.json --out D  # compiles it, in the GPU image
     python builder.py --finish build.json --out D # pushes the wheel, tells the backend
 
-Run by ``.github/workflows/cache.yml`` (its ``wheels`` job). Only ``--build``
+Run by ``.github/workflows/CD.yml`` (its ``wheels`` job). Only ``--build``
 runs inside the GPU image, which is what the nodes run: the wheel is built
 against the image's Python and torch, and those are part of the key a node
 looks it up by. The other three run on the runner, and they alone are given

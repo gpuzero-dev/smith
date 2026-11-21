@@ -78,7 +78,7 @@ FROM wheels-${LIBS} AS wheels
 # in pieces, several at once: from the backend's cache when the node uses it
 # (SMITH_CACHE=backend), else from a mirror if SMITH_RUNTIME_URL is set, else
 # from the index they were resolved from. The cache's copies are uploaded by
-# .github/workflows/cache.yml, from this lock, as soon as the image is
+# .github/workflows/CD.yml, from this lock, as soon as the image is
 # published and again every hour.
 #
 # Resolved here from runtime.in, with both indexes: torch is pinned with its

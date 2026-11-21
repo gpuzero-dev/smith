@@ -44,7 +44,7 @@ the cache or the mirror serves every image that names it, and filling either
 is uploading the names it lacks.
 
 **Filling the cache** (``fill``). Run by this repository's
-``.github/workflows/cache.yml`` (its ``runtime`` job) as soon as an image
+``.github/workflows/CD.yml`` (its ``runtime`` job) as soon as an image
 is published and again every hour, with the manifest taken out of that
 image. It asks the backend's builder service -
 ``--builder``, with the builder token in ``SMITH_BUILDER_TOKEN``, never on the

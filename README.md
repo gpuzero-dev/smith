@@ -38,7 +38,8 @@ docker build -t smith --build-arg LIBS=source \
 ```
 
 The GPU image is published by pushing to the `deploy` branch
-(`git push origin main:deploy`): `.github/workflows/image.yml` builds it from
+(`git push origin main:deploy`): `.github/workflows/CD.yml`, its `gpu` job,
+once `CI.yml` has passed on that commit, builds it from
 PyPI and pushes it as `ghcr.io/<owner>/smith-gpu:<commit>`, smith's short
 commit, and as `:latest`, then checks both tags are in the registry and that
 no layer is over 250 MB. Last, it tells the backend which bytes it pushed:
@@ -48,7 +49,7 @@ should start nodes from that digest, not from a tag: anyone who can push a
 branch of this repository can run a workflow that rewrites a tag in the
 registry, while that token is a secret of the `production` environment,
 which only `main` and `deploy` enter. It is a token of its own, which no
-other workflow is given: what fills the cache cannot choose the bytes nodes
+other job is given: what fills the cache cannot choose the bytes nodes
 run.
 
 **The GPU image does not carry torch.** torch with its CUDA libraries is
@@ -66,7 +67,7 @@ else a mirror if `SMITH_RUNTIME_URL` is set, where each wheel is at its own
 file name; else the index the wheel was resolved from.
 
 **Who fills the cache's `runtime/`.** This repository's
-`.github/workflows/cache.yml`, its `runtime` job: as soon as `image.yml` has
+`.github/workflows/CD.yml`, its `runtime` job: as soon as its `gpu` job has
 published an image, then every hour (or by hand), for the image nodes start
 from, which the backend names by digest in its answer to
 `POST /api/cache-builds/pending` (`{"queued": <n>, "image": "sha256:..."}`),
