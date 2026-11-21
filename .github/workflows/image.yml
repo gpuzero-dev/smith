@@ -34,7 +34,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The whole CI of this commit first: no image is built and pushed, and no
+  # digest reaches the backend, unless it passes (GPU-487). CI before CD.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   gpu:
+    needs: ci
     environment: production
     runs-on: ubuntu-latest
     steps:
