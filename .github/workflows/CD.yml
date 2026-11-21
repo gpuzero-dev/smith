@@ -125,6 +125,10 @@ jobs:
     if: github.event_name == 'push'
     needs: window
     uses: ./.github/workflows/CI.yml
+    # CI.yml's jobs cancel the whole run when one fails (fail fast).
+    permissions:
+      contents: read
+      actions: write
 
   gpu:
     # Skipped whenever `ci` is, so only on a push to deploy.

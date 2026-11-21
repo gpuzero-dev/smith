@@ -18,6 +18,10 @@ on:
 # Checks only: the token reads the repository and does nothing else.
 permissions:
   contents: read
+  # actions: write is for the last step of every job (fail fast): a job that
+  # fails cancels the whole run, and with it the CD that called it, so no
+  # other job keeps spending minutes on a commit already known to be bad.
+  actions: write
 
 # An ordinary run supersedes the one before it on the same ref: only the
 # newest commit's verdict matters. A call from CD.yml is different: inside a
@@ -101,6 +105,12 @@ jobs:
       # there is an S3 server (tests/test_cache_s3.py says how).
       - run: python -m pip install --quiet pytest
       - run: python -m pytest tests -q
+      - name: Stop the whole run
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
 
   image:
     # The CPU image from PyPI: proves the repository builds on its own, without
@@ -120,3 +130,9 @@ jobs:
         run: |
           docker run --rm smith:ci python -c "import moonclip, ravex; print(ravex.__version__)"
           docker run --rm smith:ci test -f /app/examples/spiral.py
+      - name: Stop the whole run
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
