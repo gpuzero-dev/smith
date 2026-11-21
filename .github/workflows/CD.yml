@@ -79,6 +79,9 @@ on:
 permissions:
   contents: read
 
+# A timeout on every job (GPU-493), so that nothing holds a runner for
+# GitHub's default of six hours; each says why its number.
+
 # No concurrency for the whole workflow: the hourly runs and the pushes to
 # deploy would queue behind each other, and GitHub keeps only one waiting run
 # per group, so an hour could replace a push's image. Each job that must not
@@ -108,7 +111,31 @@ jobs:
     concurrency:
       group: gpu-image
       cancel-in-progress: false
+    # Three to six minutes on every image of November 2026; thirty leaves
+    # room for a build with nothing cached, and for a slow registry.
+    timeout-minutes: 30
     steps:
+      # Every action is pinned to a commit, its tag beside it: a tag can be
+      # moved by whoever controls the action, and this job may publish the
+      # image every node starts from (packages: write). Moving to a newer
+      # release is a change of the pin, made on purpose.
+      #
+      # Full history: the check below has to prove the commit is on main.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      # The provenance check ravex's and moonclip's CD make before they tag
+      # (GPU-493): deploy publishes what main has, not a commit pushed there
+      # from a branch nobody merged. First, so such a push builds nothing,
+      # publishes nothing and tells the backend nothing.
+      - name: The commit must be on main
+        run: |
+          set -eu
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "deploy is at $(git rev-parse --short HEAD), which is not on main." >&2
+            echo "Push main to it: git push origin main:deploy. No image was built." >&2
+            exit 1
+          fi
       # torch with its CUDA libraries does not fit beside what the runner
       # ships with; these are the largest of the tools it does not need.
       - name: Make room
@@ -116,11 +143,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           docker system prune -af
           df -h /
-      # Every action is pinned to a commit, its tag beside it: a tag can be
-      # moved by whoever controls the action, and this job may publish the
-      # image every node starts from (packages: write). Moving to a newer
-      # release is a change of the pin, made on purpose.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Tag
         id: tag
         run: |
@@ -211,6 +233,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # To read the CI run of the commit, below.
+      actions: read
     # Every pipe fails its step, as `fill | tee` must when fill does.
     defaults:
       run:
@@ -223,14 +247,38 @@ jobs:
       group: cache-runtime
       cancel-in-progress: false
     steps:
+      # On the hour and by hand this runs main's head, which no `ci` job
+      # vouched for: only a push to deploy goes through it (GPU-493). So the
+      # commit's own CI run has to have passed, or nothing below runs this
+      # commit's code with the cache's token. Not a failure when it has not:
+      # a CI still running on a commit pushed a minute ago is the usual case,
+      # and the next hour finds it finished.
+      - name: CI passed on this commit
+        id: ci
+        if: github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          conclusion=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/CI.yml/runs?head_sha=$GITHUB_SHA&per_page=1" \
+            --jq '.workflow_runs[0] | if . == null then "never run" else (.conclusion // .status) end')
+          if [ "$conclusion" = "success" ]; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+            echo "CI passed on ${GITHUB_SHA::7}"
+          else
+            echo "::warning title=Nothing filled or built::CI on ${GITHUB_SHA::7} is $conclusion, not success: this run stops here, and the next one asks again."
+            echo "CI on \`${GITHUB_SHA::7}\` is $conclusion, not success: nothing was filled or built." >> "$GITHUB_STEP_SUMMARY"
+          fi
       # On the hour, main's commit: its runtime.py reads every lock of version
       # 1, an older image's too, which may predate fill. After a push, the
       # commit just published, whose runtime.py wrote this very lock.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The digest nodes start from, which the backend holds. Without the
       # secrets (a fork), or a backend that names none, there is no image.
+      # Every step after this one waits on its output, so skipping it on a
+      # commit whose CI did not pass skips them all.
       - name: Image
         id: image
+        if: github.event_name == 'push' || steps.ci.outputs.ok == '1'
         env:
           SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
           SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
@@ -288,6 +336,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # To read the CI run of the commit, below.
+      actions: read
     defaults:
       run:
         shell: bash
@@ -300,11 +350,35 @@ jobs:
       group: wheels
       cancel-in-progress: false
     steps:
+      # On the hour and by hand this runs main's head, which no `ci` job
+      # vouched for: only a push to deploy goes through it (GPU-493). So the
+      # commit's own CI run has to have passed, or nothing below runs this
+      # commit's code with the cache's token. Not a failure when it has not:
+      # a CI still running on a commit pushed a minute ago is the usual case,
+      # and the next hour finds it finished.
+      - name: CI passed on this commit
+        id: ci
+        if: github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          conclusion=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/CI.yml/runs?head_sha=$GITHUB_SHA&per_page=1" \
+            --jq '.workflow_runs[0] | if . == null then "never run" else (.conclusion // .status) end')
+          if [ "$conclusion" = "success" ]; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+            echo "CI passed on ${GITHUB_SHA::7}"
+          else
+            echo "::warning title=Nothing filled or built::CI on ${GITHUB_SHA::7} is $conclusion, not success: this run stops here, and the next one asks again."
+            echo "CI on \`${GITHUB_SHA::7}\` is $conclusion, not success: nothing was filled or built." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Asked before anything heavy: most hours there is nothing to build, and
       # the image is gigabytes. The answer names the image too, by digest.
+      # Every step after this one waits on its output, so skipping it on a
+      # commit whose CI did not pass skips them all.
       - name: Anything to build
         id: pending
+        if: steps.ci.outputs.ok == '1'
         env:
           SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
           SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}

@@ -30,9 +30,14 @@ concurrency:
   group: ${{ github.workflow == 'CI' && format('ci-{0}', github.ref) || format('ci-cd-{0}', github.run_id) }}
   cancel-in-progress: true
 
+# A timeout on every job (GPU-493): GitHub's default is six hours, and CD.yml
+# waits on this file before it publishes. Both jobs finished in about a minute
+# on every run of November 2026; ten and fifteen leave room for a slow index
+# or registry without letting a hang hold the runner.
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -54,8 +59,18 @@ jobs:
           EOF
       # The images install the libraries' latest releases (GPU-366): until
       # 2026-11-08 they installed ravex 0.10.1 while 0.11.x was out, and the
-      # nodes ignored a stop that the docs said saves first. A release of
-      # either turns this red until both Dockerfiles are moved to it.
+      # nodes ignored a stop that the docs said saves first.
+      #
+      # A pin behind PyPI is a warning, not a failure (GPU-493). It used to
+      # fail, which turned this CI red at every Ravex or Moonclip release, on
+      # commits that had not changed, until both Dockerfiles were moved - and
+      # CD.yml runs this file, so a release elsewhere also blocked every
+      # deploy of smith, an urgent fix included, behind an unrelated bump. The
+      # warning still shows on every run, the deploy's included, which is
+      # where the bump gets remembered. The same goes for PyPI not answering:
+      # its outage is not this commit's fault either. The two Dockerfiles
+      # disagreeing stays a failure: that is a mistake made here, and nothing
+      # outside causes it.
       - name: The images pin the latest releases
         run: |
           python - <<'EOF'
@@ -69,11 +84,17 @@ jobs:
                   pins.setdefault(name.lower(), set()).add(found[0])
           for package, versions in sorted(pins.items()):
               assert len(versions) == 1, "the two Dockerfiles pin %s differently: %s" % (package, sorted(versions))
-              with urllib.request.urlopen("https://pypi.org/pypi/%s/json" % package, timeout=30) as answer:
-                  latest = json.load(answer)["info"]["version"]
               pinned = versions.pop()
-              assert pinned == latest, "%s: the images pin %s, PyPI's latest is %s" % (package, pinned, latest)
-              print("ok", package, pinned)
+              try:
+                  with urllib.request.urlopen("https://pypi.org/pypi/%s/json" % package, timeout=30) as answer:
+                      latest = json.load(answer)["info"]["version"]
+              except OSError as error:
+                  print("::warning title=PyPI did not answer::could not check %s %s against PyPI: %s" % (package, pinned, error))
+                  continue
+              if pinned != latest:
+                  print("::warning title=%s behind PyPI::the images pin %s %s, PyPI's latest is %s: move %s_VERSION in Dockerfile and Dockerfile.gpu" % (package, package, pinned, latest, package.upper()))
+              else:
+                  print("ok", package, pinned)
           EOF
       # pytest for the tests only, after the checks above have run on a bare
       # interpreter. Without Moonclip the bucket's tests skip: those run where
@@ -86,6 +107,7 @@ jobs:
     # any checkout of the libraries. The GPU image is the same recipe with gigabytes more
     # torch: it is built and pushed by CD.yml, on a push to the deploy branch.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
