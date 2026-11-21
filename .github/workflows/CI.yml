@@ -107,10 +107,14 @@ jobs:
       - run: python -m pytest tests -q
       - name: Stop the whole run
         if: failure()
+        env:
+          MATRIX: ${{ matrix && toJSON(matrix) || '' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
+            // The cancel marks this job cancelled too: the error says which one failed.
+            core.error(`${context.job} ${process.env.MATRIX} failed: the rest of the run is cancelled`);
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId });
 
   image:
     # The CPU image from PyPI: proves the repository builds on its own, without
@@ -132,7 +136,11 @@ jobs:
           docker run --rm smith:ci test -f /app/examples/spiral.py
       - name: Stop the whole run
         if: failure()
+        env:
+          MATRIX: ${{ matrix && toJSON(matrix) || '' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
+            // The cancel marks this job cancelled too: the error says which one failed.
+            core.error(`${context.job} ${process.env.MATRIX} failed: the rest of the run is cancelled`);
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId });
