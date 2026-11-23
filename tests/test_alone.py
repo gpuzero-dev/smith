@@ -300,6 +300,30 @@ def test_output_the_backend_will_never_take_is_passed_by(tmp_path):
     assert asked[-1] == ["four"]
 
 
+def test_a_machine_is_busy_until_its_last_job_s_output_has_arrived(tmp_path):
+    """The backend gives a machine back once its agent holds no job; the
+    last lines of a stopped job went with it (GPU-504)."""
+    agent = _agent()
+    assert agent.holding() is None
+    path = str(tmp_path / "out.log")
+    with open(path, "wb") as handle:
+        handle.write(b"SIGTERM received\n")
+    tail = smith.LogTail(7, path)
+    tail.done = True
+    agent.tails.append(tail)
+    assert agent.holding() == 7
+    sent = []
+
+    class Taking:
+        def call(self, method, url, body=None):
+            sent.append(body["lines"])
+
+    agent.backend = Taking()
+    agent.send_logs()
+    assert sent == [["SIGTERM received"]]
+    assert agent.holding() is None
+
+
 def test_a_stop_goes_on_without_the_backend():
     """The spot notice and the kill after the grace waited on a heartbeat
     that was answered (GPU-466)."""

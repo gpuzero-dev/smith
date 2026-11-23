@@ -1891,7 +1891,7 @@ class Agent:
                 "params": self.config.params,
                 "hardware": self.config.hardware,
                 "host": socket.gethostname(),
-                "job_id": self.current.id if self.current else None,
+                "job_id": self.holding(),
                 # Only when there is one: a backend that knows nothing of it
                 # is not sent a field it would have to ignore.
                 **({"fault": self.fault} if self.fault else {}),
@@ -1899,6 +1899,20 @@ class Agent:
                 **({"pushing": True} if any(p.poll() is None for p in self.pushing) else {}),
             },
         )
+
+    def holding(self) -> Optional[int]:
+        """The job this machine is still busy with: the one running, or one
+        whose output has not all reached the backend yet.
+
+        A backend gives a machine back once its agent says it holds no job.
+        Said as soon as the process exited, the machine went while the last
+        lines of the job's output - its shutdown, the reason a run stopped
+        the way it did - were still here to be sent: on 2026-11-23 a run
+        stopped from the console lost every line after the signal, on both
+        of its nodes (GPU-504)."""
+        if self.current is not None:
+            return self.current.id
+        return next((tail.job_id for tail in self.tails), None)
 
     def report(self, job_id: int, state: str, message: Optional[str] = None, run_id: Optional[str] = None) -> Dict[str, Any]:
         body: Dict[str, Any] = {"state": state}
