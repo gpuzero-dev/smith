@@ -207,8 +207,14 @@ POLL_SECONDS = 2.0
 #: the backend takes to reach the process, at most.
 REPORT_SECONDS = 4.0
 
-#: How long a job that was asked to stop has before it is killed.
-STOP_GRACE_SECONDS = 60.0
+#: How long a job that was asked to stop has before it is killed: the time
+#: Ravex needs for its final checkpoint, written and in the bucket. 60 s cut
+#: off a 9 GB one half way (GPU-509, deepseek-1b: about 4 minutes to R2 from
+#: vast.ai), and the run kept only its previous checkpoint. The node stays
+#: the job's until the process exits, so this is paid for; it bounds a job
+#: that ignores the interrupt. A provider taking the machine back ends it at
+#: its own notice whatever this says.
+STOP_GRACE_SECONDS = 30 * 60.0
 
 #: Why a job was told to stop, as the log says it and, for the first, as the
 #: failure's message does: a cancel on the backend, and a notice that the

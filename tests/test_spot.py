@@ -314,3 +314,24 @@ def test_the_launcher_leaves_sigterm_to_the_script(tmp_path):
     if hasattr(signal, "SIGBREAK"):
         # On Windows a stop is CTRL_BREAK, still turned into an interrupt.
         assert "SIGBREAK" in smith._LAUNCHER
+
+
+def test_a_stopped_job_gets_minutes_for_its_final_checkpoint_then_is_killed(monkeypatch):
+    # GPU-509: a 9 GB final checkpoint needs minutes to reach the bucket, and
+    # a kill after 60 s left the run without it.
+    killed = []
+    job = types.SimpleNamespace(
+        id=7, process=types.SimpleNamespace(poll=lambda: None, pid=1),
+        stop_requested_at=None, stop_reason=None, kill=lambda: killed.append(True),
+    )
+    monkeypatch.setattr(smith.os, "killpg", lambda *_args: None, raising=False)
+    monkeypatch.setattr(smith.os, "kill", lambda *_args: None)
+    now = [1000.0]
+    monkeypatch.setattr(smith.time, "monotonic", lambda: now[0])
+    smith.Running.stop(job)
+    now[0] += 10 * 60
+    smith.Running.stop(job)
+    assert killed == [], "a job still saving was killed before its grace was over"
+    now[0] += smith.STOP_GRACE_SECONDS
+    smith.Running.stop(job)
+    assert killed == [True]
