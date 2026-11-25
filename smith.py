@@ -28,9 +28,10 @@ would be a remote shell on every training machine.
 
 **Code from a repository.** An agent started with ``code = true`` (or
 ``SMITH_CODE=1``) also takes jobs that carry ``code``: a repository over
-HTTPS, a commit as a full SHA, and the name of a manifest file in it. The job
-names a script from the manifest's ``[scripts]`` table - the same shape as
-this file's - instead of one of the agent's own. Before it starts, the job's
+HTTPS and a commit as a full SHA. The job's ``script`` is then the path of a
+Python file of that commit, the one the person chose to run, instead of one
+of the agent's own; nothing of the backend's lives in the repository
+(GPU-497). Before it starts, the job's
 process fetches that commit alone into ``runs/_code/<repository>/<commit>``,
 makes a virtual environment beside it when the repository has a
 ``requirements.txt`` or a ``pyproject.toml`` (on top of this Python's own
@@ -38,7 +39,8 @@ packages, so torch and Ravex are there already; with ``uv`` when it is
 installed) and then runs the script with the job's parameters as flags. A
 commit already fetched is used again. Every step is in the job's output, with
 how long it took (GPU-219). It
-is still never a command: a repository, a commit and a name, each checked.
+is still never a command: a repository, a commit and a file of it, each
+checked.
 It is opt-in because it runs whatever the repository holds: on a machine of
 the person whose repository it is, or one rented for them, that is the point;
 on a machine shared with others, leave it off. A private repository's token
@@ -425,24 +427,23 @@ RUNTIME_SECONDS = 15 * 60.0
 
 
 #: What a job's code may be: a repository over HTTPS, a commit as a full SHA,
-#: a manifest and a script named plainly. Checked before anything runs, so a
-#: value cannot become an option of git or a path out of the checkout.
+#: and a Python file of it. Checked before anything runs, so a value cannot
+#: become an option of git or a path out of the checkout.
 _REPO = re.compile(r"^https://[A-Za-z0-9.-]+(?::\d+)?/[A-Za-z0-9_.~/-]+$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
-_RELATIVE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9_./-]{1,200}$")
-_SCRIPT = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+_RELATIVE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9_./-]{1,200}\.py$")
 #: What a parameter's name may be: it becomes a flag, ``--name``. Checked with
 #: ``fullmatch`` like the others, since ``$`` alone also matches before a
 #: final newline.
 _PARAM = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 
 #: A job with ``code`` runs this first, as its own process: fetch the commit,
-#: make its environment, find the script in the manifest, then become the
+#: make its environment, check the script is a file of it, then become the
 #: training. In the job's process and not in this agent, so a clone and an
 #: install of several minutes neither stop the heartbeats nor escape the
 #: job's output, and a stop reaches them like it reaches the training.
 _PREPARE = r"""
-import base64, json, os, shutil, signal, subprocess, sys, time, tomllib, urllib.request
+import base64, json, os, shutil, signal, subprocess, sys, time, urllib.request
 
 # Every step says how long it took, from this process's start: the job's log
 # is the only place the time of a node's start can be read from, and its lines
@@ -613,19 +614,11 @@ else:
 # repository installed in its environment is a key of its own.
 cache("pull", python, ("triton", "inductor", "tilelang"))
 
-manifest = os.path.join(tree, spec["manifest"])
-if not os.path.isfile(manifest):
-    fail("%s has no %s, which names the scripts that may be run" % (short, spec["manifest"]))
-with open(manifest, "rb") as handle:
-    scripts = tomllib.load(handle).get("scripts") or {}
-entry = scripts.get(spec["script"])
-if entry is None:
-    fail("%s declares no script %r; it has %s" % (spec["manifest"], spec["script"], ", ".join(sorted(scripts)) or "none"))
-path = entry.get("path") if isinstance(entry, dict) else entry
 root = os.path.realpath(tree)
-script = os.path.realpath(os.path.join(root, str(path or "")))
-if not path or os.path.commonpath([script, root]) != root or not os.path.isfile(script):
-    fail("scripts.%s in %s is not a file of the repository" % (spec["script"], spec["manifest"]))
+script = os.path.realpath(os.path.join(root, spec["script"]))
+# Inside the checkout and a file of it: a link that leads out is refused too.
+if os.path.commonpath([script, root]) != root or not os.path.isfile(script):
+    fail("%s has no file %s to run" % (short, spec["script"]))
 
 if spec["gpus"] > 1:
     command = [python, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node", str(spec["gpus"]),
@@ -1500,7 +1493,6 @@ class Running:
                 {
                     "repo": self.code["repo"],
                     "commit": self.code["commit"],
-                    "manifest": self.code["manifest"],
                     "script": job["script"],
                     "tree": os.path.join(self.code["root"], self.code["commit"]),
                     "gpus": config.gpus,
@@ -1552,25 +1544,23 @@ class Running:
 
     @staticmethod
     def _checked_code(job: Dict[str, Any], config: Config) -> Dict[str, Any]:
-        """The job's repository, commit and manifest, each held to what it may
-        be, and where its checkouts go; refused on an agent that runs no code."""
+        """The job's repository, commit and script - a Python file of that
+        commit - each held to what it may be, and where its checkouts go;
+        refused on an agent that runs no code."""
         if not config.code:
             raise RuntimeError("this agent runs only its own scripts (code = true to run a repository's)")
         code = job["code"]
         repo, commit = str(code.get("repo") or ""), str(code.get("commit") or "")
-        manifest = str(code.get("manifest") or "")
         if not _REPO.fullmatch(repo) or ".." in repo:
             raise RuntimeError("%r is not a repository this agent fetches: an https address" % repo)
         if not _SHA.fullmatch(commit):
             raise RuntimeError("%r is not a commit: a full SHA, 40 hexadecimal characters" % commit)
-        if not _RELATIVE.fullmatch(manifest):
-            raise RuntimeError("%r is not a file of a repository" % manifest)
-        if not _SCRIPT.fullmatch(str(job.get("script") or "")):
-            raise RuntimeError("%r is not a script's name" % job.get("script"))
+        if not _RELATIVE.fullmatch(str(job.get("script") or "")):
+            raise RuntimeError("%r is not a Python file of a repository" % job.get("script"))
         # One directory per repository, its commits side by side.
         place = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo.split("://", 1)[1]).strip("-")
         root = os.path.join(config.runs, "_code", place)
-        return {**code, "repo": repo, "commit": commit, "manifest": manifest, "root": root}
+        return {**code, "repo": repo, "commit": commit, "root": root}
 
     def stop(self, reason: str = CANCELLED) -> None:
         now = time.monotonic()

@@ -126,9 +126,9 @@ The rendezvous address and the run's other settings come in the job's
 
 With `code = true` in its configuration (or `SMITH_CODE=1`), smith claims
 with `"code": true` and may get a job that carries `code`: `repo` (an https
-address), `commit` (a full SHA), `manifest` (a file in the repository with a
-`[scripts]` table, like smith's own) and, for a private repository, `token`.
-The job's `script` is then one of the manifest's. smith fetches that commit
+address), `commit` (a full SHA) and, for a private repository, `token`. The
+job's `script` is then the path of a Python file of that commit (`train.py`,
+`scripts/train.py`), checked to be one before anything runs. smith fetches that commit
 alone, installs its `requirements.txt` or `pyproject.toml` in a virtual
 environment on top of its own packages (with `uv` when there is one), and runs
 the script with the job's parameters. It runs whatever the repository holds,
