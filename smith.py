@@ -130,8 +130,10 @@ process group of its own, and would otherwise die with the container, its
 last checkpoint unwritten. A job that ends by itself takes its group with it
 too: whatever its process left running there - a TensorBoard, a profiler, a
 rank - would keep its GPU memory from the next job (GPU-530). Under torchrun
-the ranks are each in a session of their own, out of the group's reach;
-only with a job user of its own, whose every process goes, do they go too.
+the ranks are each in a session of their own, out of the group's reach: a
+kill reaches them through torchrun's process tree, read just before, and
+with a job user of its own every process of that user goes too, what left
+the tree included.
 
 **A bucket without keys (GPU-331).** A job's storage on AWS may come with a
 region and no keys: the node's instance role writes the bucket, and the run is
@@ -1045,6 +1047,30 @@ for top in sys.argv[1:]:
             if not stat.S_ISLNK(mode):
                 os.chmod(path, stat.S_IMODE(mode) & 0o755)
 """
+
+
+def descendants(pid: int) -> List[int]:
+    """Every process under ``pid``, by the parents ``/proc`` names; none
+    where there is no ``/proc``. What a kill of the job's group misses under
+    torchrun, which starts each rank in a session of its own (GPU-530)."""
+    if not os.path.isdir("/proc"):
+        return []
+    children: Dict[int, List[int]] = {}
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            try:
+                with open("/proc/%s/stat" % name, encoding="utf-8") as handle:
+                    parent = int(handle.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            children.setdefault(parent, []).append(int(name))
+    found: List[int] = []
+    todo = [pid]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            found.append(child)
+            todo.append(child)
+    return found
 
 
 def kill_user(identity: Optional[Tuple[int, int]], spare: Tuple[int, ...] = ()) -> None:
@@ -2085,6 +2111,11 @@ class Running:
         """Kill the job's whole process group, as the interrupt went to it:
         the process is torchrun, and killing it alone left its ranks alive,
         holding the GPUs under a job the backend counts as ended (GPU-453)."""
+        # The whole tree first, while torchrun still holds it together: its
+        # ranks are each in a session of their own, out of the group's reach,
+        # and once torchrun is dead they no longer descend from it (GPU-530).
+        # Not once it was reaped: its pid may be another process's by then.
+        tree = descendants(self.process.pid) if os.name != "nt" and self.process.poll() is None else []
         try:
             if os.name == "nt":
                 self.process.kill()
@@ -2092,6 +2123,11 @@ class Running:
                 os.killpg(self.process.pid, signal.SIGKILL)
         except OSError:
             pass
+        for pid in tree:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
         # torchrun's ranks are in sessions of their own, out of the group's
         # reach: with a job user, everything of that user goes but the run's
         # rendezvous, which the other nodes still need (GPU-530).

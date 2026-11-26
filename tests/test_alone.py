@@ -85,11 +85,12 @@ def test_an_answer_that_is_not_json_is_a_backend_that_did_not_answer(monkeypatch
 
 @pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX's")
 def test_the_kill_after_the_grace_reaches_the_ranks(monkeypatch):
-    """torchrun's children are in its group, and die with it."""
+    """The job's group is killed whole; torchrun's ranks, each in a session
+    of its own, are reached through its process tree (test_job_user)."""
     killed = []
     monkeypatch.setattr(smith.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
     running = smith.Running.__new__(smith.Running)
-    running.process = type("P", (), {"pid": 4242})()
+    running.process = type("P", (), {"pid": 4242, "poll": lambda self: 0})()
     running.kill()
     assert killed == [(4242, smith.signal.SIGKILL)]
 

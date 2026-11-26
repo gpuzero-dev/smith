@@ -399,3 +399,29 @@ def test_a_script_reads_beside_itself_and_writes_where_it_runs(runs):
         assert not (release / "examples" / "out.txt").exists() and not (own / "out.txt").exists()
         running.close()
 
+
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="the job's process tree is read from /proc")
+def test_a_kill_reaches_what_left_the_jobs_group_as_the_agents_user(tmp_path):
+    """torchrun starts each rank in a session of its own, which a kill of
+    the job's group never reached (GPU-530): with no job user of its own,
+    the job's tree is read before the kill."""
+    child = tmp_path / "child.pid"
+    (tmp_path / "scripts").mkdir()
+    script = tmp_path / "scripts" / "rank.py"
+    script.write_text(
+        "import subprocess, time\n"
+        "p = subprocess.Popen(['sleep', '300'], start_new_session=True)\n"
+        "open(%r, 'w').write(str(p.pid))\n"
+        "time.sleep(300)\n" % str(child)
+    )
+    config = smith.Config(backend="http://127.0.0.1:1", name="n", hardware="h", runs=str(tmp_path / "runs"),
+                          python=sys.executable, scripts={"rank": str(script)}, **RUNTIMES)
+    made(tmp_path / "runs")
+    running = smith.Running({"id": 4, "script": "rank", "mode": "fresh", "name": "n", "run_ref": "r-004",
+                             "params": {}, "template": TEMPLATE}, config)
+    assert _until(lambda: child.exists() and child.read_text().isdigit(), 60)
+    pid = int(child.read_text())
+    running.kill()
+    assert _until(lambda: _gone(pid))
+    running.process.wait(timeout=10)
+    running.close()
