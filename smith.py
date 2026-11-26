@@ -690,6 +690,10 @@ class Config:
     #: stopped and the machine ended (see "A node the backend no longer
     #: answers" above); 0 never.
     alone_minutes: float = 0.0
+    #: What this machine costs an hour, in dollars, when whoever rented it
+    #: says so: a job is told it as ``RAVEX_PRICE_PER_HOUR``, and the run
+    #: reports its cost per token. None says nothing.
+    price_per_hour: Optional[float] = None
 
     @classmethod
     def load(cls, path: str) -> "Config":
@@ -754,6 +758,7 @@ class Config:
             cache_service=str(env("SMITH_CACHE") or raw.get("cache", "")).lower() == "backend",
             runtime=resolve(raw["runtime"]) if raw.get("runtime") else None,
             alone_minutes=max(0.0, float(env("SMITH_ALONE_MINUTES") or raw.get("alone_minutes", 0) or 0)),
+            price_per_hour=float(env("SMITH_PRICE_PER_HOUR") or raw.get("price_per_hour", 0) or 0) or None,
         )
 
 
@@ -1363,6 +1368,8 @@ class Running:
         env["RAVEX_METRICS_ENDPOINT"] = config.backend
         if config.token:
             env["RAVEX_METRICS_TOKEN"] = config.token
+        if config.price_per_hour:
+            env["RAVEX_PRICE_PER_HOUR"] = str(config.price_per_hour)
         source = ""
         if job["mode"] in ("resume", "update", "fork"):
             source = job.get("source_store_uri") or ""

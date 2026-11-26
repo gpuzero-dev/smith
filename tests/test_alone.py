@@ -106,6 +106,14 @@ def test_the_setting_comes_from_the_environment(tmp_path, monkeypatch):
     assert smith.Config.load(str(path)).alone_minutes == 30
 
 
+def test_the_price_comes_from_the_environment(tmp_path, monkeypatch):
+    path = tmp_path / "smith.toml"
+    path.write_text('code = true\n')
+    assert smith.Config.load(str(path)).price_per_hour is None
+    monkeypatch.setenv("SMITH_PRICE_PER_HOUR", "1.89")
+    assert smith.Config.load(str(path)).price_per_hour == 1.89
+
+
 def _running():
     exits = iter([None, None, 143])
     stopped = []
@@ -247,7 +255,8 @@ def test_a_job_is_not_given_what_is_the_agents_alone(tmp_path, monkeypatch):
     monkeypatch.setenv("MOONCLIP_S3_ACCESS_KEY", "agents-key")
     monkeypatch.setenv("MOONCLIP_S3_SECRET_KEY", "agents-secret")
     config = smith.Config(backend="http://127.0.0.1:1", name="n", hardware="h", runs=str(tmp_path / "runs"),
-                          python=sys.executable, scripts={"show": str(script)}, token="agent-token")
+                          python=sys.executable, scripts={"show": str(script)}, token="agent-token",
+                          price_per_hour=1.89)
     job = {"id": 1, "script": "show", "mode": "fresh", "name": "n", "run_ref": "r-001", "params": {},
            "storage": {"type": "s3", "bucket": "theirs", "region": "eu-west-1"}}
     running = smith.Running(job, config)
@@ -260,6 +269,8 @@ def test_a_job_is_not_given_what_is_the_agents_alone(tmp_path, monkeypatch):
     # The run still reports its metrics with it, and the output never carries it back.
     assert env["RAVEX_METRICS_TOKEN"] == "agent-token"
     assert running.hidden["SMITH_TOKEN"] == "agent-token"
+    # What the machine costs, for the run's cost per token (GPU-522).
+    assert env["RAVEX_PRICE_PER_HOUR"] == "1.89"
 
 
 def test_output_the_backend_will_never_take_is_passed_by(tmp_path):
