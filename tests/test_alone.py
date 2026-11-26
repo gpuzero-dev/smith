@@ -452,6 +452,29 @@ def test_a_refused_end_still_ships_the_run_and_its_kernels():
     assert pushed == [True]
 
 
+def test_a_job_that_cannot_start_is_said_failed_through_a_backend_that_fails_once(monkeypatch):
+    """Said once, a 502 or no answer left the job "claimed" for good
+    (GPU-530)."""
+    agent = _agent()
+    said = []
+    answers = [{"id": 9, "script": "nowhere", "mode": "fresh", "name": "n"}, smith.Unreachable("down"), {}]
+
+    def call(method, path, body=None):
+        said.append((method, path, body))
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(agent.backend, "call", call)
+    monkeypatch.setattr(smith.time, "sleep", lambda _seconds: None)
+    agent.take()
+    assert agent.current is None
+    patches = [body for method, path, body in said if method == "PATCH"]
+    assert len(patches) == 2 and all(body["state"] == "failed" for body in patches)
+    assert "could not start it" in patches[-1]["message"] and "run_id" not in patches[-1]
+
+
 def test_no_job_is_taken_until_the_old_ones_are_closed(monkeypatch):
     """Asked once, at a start the backend missed, the jobs an earlier start
     left were never closed (GPU-474)."""

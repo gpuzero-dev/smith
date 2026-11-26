@@ -2034,7 +2034,10 @@ class Agent:
             self.current = Running(job, self.config)
         except Exception as exc:
             log("job %d cannot start: %s" % (job["id"], exc))
-            self.report(int(job["id"]), "failed", "the agent could not start it: %s" % exc)
+            # Until heard, like the end of a job that ran (GPU-530): a 5xx or no
+            # answer here left the job "claimed" for good, since only a start
+            # of the agent closes what it holds.
+            self._report_until_heard(int(job["id"]), "failed", "the agent could not start it: %s" % exc, None)
             return
         self.current.last_report = time.monotonic()
         self.tails.extend(self.current.outputs)
@@ -2208,7 +2211,7 @@ class Agent:
                 self.shipping = (store, process, due >= 0)
                 return
 
-    def _report_until_heard(self, job_id: int, state: str, message: Optional[str], run_id: str) -> None:
+    def _report_until_heard(self, job_id: int, state: str, message: Optional[str], run_id: Optional[str]) -> None:
         # The end of a job is the one report that must not be lost: without it
         # the backend shows a run as going forever.
         while True:
