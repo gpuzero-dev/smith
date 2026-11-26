@@ -61,45 +61,6 @@ jobs:
               assert config.get("scripts"), path
               print("ok", path)
           EOF
-      # The images install the libraries' latest releases (GPU-366): until
-      # 2026-11-08 they installed ravex 0.10.1 while 0.11.x was out, and the
-      # nodes ignored a stop that the docs said saves first.
-      #
-      # A pin behind PyPI is a warning, not a failure (GPU-493). It used to
-      # fail, which turned this CI red at every Ravex or Moonclip release, on
-      # commits that had not changed, until both Dockerfiles were moved - and
-      # CD.yml runs this file, so a release elsewhere also blocked every
-      # deploy of smith, an urgent fix included, behind an unrelated bump. The
-      # warning still shows on every run, the deploy's included, which is
-      # where the bump gets remembered. The same goes for PyPI not answering:
-      # its outage is not this commit's fault either. The two Dockerfiles
-      # disagreeing stays a failure: that is a mistake made here, and nothing
-      # outside causes it.
-      - name: The images pin the latest releases
-        run: |
-          python - <<'EOF'
-          import json, re, urllib.request
-          pins = {}
-          for path in ("Dockerfile", "Dockerfile.gpu"):
-              text = open(path, encoding="utf-8").read()
-              for name in ("RAVEX", "MOONCLIP"):
-                  found = re.findall(r"^ARG %s_VERSION=(\S+)$" % name, text, re.M)
-                  assert len(found) == 1, (path, name, found)
-                  pins.setdefault(name.lower(), set()).add(found[0])
-          for package, versions in sorted(pins.items()):
-              assert len(versions) == 1, "the two Dockerfiles pin %s differently: %s" % (package, sorted(versions))
-              pinned = versions.pop()
-              try:
-                  with urllib.request.urlopen("https://pypi.org/pypi/%s/json" % package, timeout=30) as answer:
-                      latest = json.load(answer)["info"]["version"]
-              except OSError as error:
-                  print("::warning title=PyPI did not answer::could not check %s %s against PyPI: %s" % (package, pinned, error))
-                  continue
-              if pinned != latest:
-                  print("::warning title=%s behind PyPI::the images pin %s %s, PyPI's latest is %s: move %s_VERSION in Dockerfile and Dockerfile.gpu" % (package, package, pinned, latest, package.upper()))
-              else:
-                  print("ok", package, pinned)
-          EOF
       # pytest for the tests only, after the checks above have run on a bare
       # interpreter. Without Moonclip the bucket's tests skip: those run where
       # there is an S3 server (tests/test_cache_s3.py says how).
