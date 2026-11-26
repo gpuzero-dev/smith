@@ -260,7 +260,8 @@ def test_a_job_is_not_given_what_is_the_agents_alone(tmp_path, monkeypatch):
                           price_per_hour=1.89, **RUNTIMES)
     made(tmp_path / "runs")
     job = {"id": 1, "script": "show", "mode": "fresh", "name": "n", "run_ref": "r-001", "params": {},
-           "storage": {"type": "s3", "bucket": "theirs", "region": "eu-west-1"}, "template": TEMPLATE}
+           "storage": {"type": "s3", "bucket": "theirs", "region": "eu-west-1"}, "template": TEMPLATE,
+           "job_token": "gzjt_the-jobs"}
     running = smith.Running(job, config)
     running.process.wait(timeout=60)
     with open(running.log_path, encoding="utf-8") as handle:
@@ -268,9 +269,15 @@ def test_a_job_is_not_given_what_is_the_agents_alone(tmp_path, monkeypatch):
     assert "SMITH_TOKEN" not in env
     assert "MOONCLIP_S3_ACCESS_KEY" not in env and "MOONCLIP_S3_SECRET_KEY" not in env
     assert env["RAVEX_STORAGE_BUCKET"] == "theirs"
-    # The run still reports its metrics with it, and the output never carries it back.
-    assert env["RAVEX_METRICS_TOKEN"] == "agent-token"
-    assert running.hidden["SMITH_TOKEN"] == "agent-token"
+    # The run reports its metrics with the job's own token, never the
+    # agent's (GPU-530), and the output carries neither back.
+    assert env["RAVEX_METRICS_TOKEN"] == "gzjt_the-jobs"
+    assert "agent-token" not in json.dumps(env)
+    assert running.hidden["SMITH_TOKEN"] == "agent-token" and running.hidden["JOB_TOKEN"] == "gzjt_the-jobs"
+    # A backend that hands no token of the job's gets no job run with the agent's.
+    del job["job_token"]
+    with pytest.raises(RuntimeError, match="job_token"):
+        smith.Running(job, config)
     # What the machine costs, for the run's cost per token (GPU-522).
     assert env["RAVEX_PRICE_PER_HOUR"] == "1.89"
 
@@ -485,7 +492,7 @@ def test_a_refused_end_still_ships_the_run_and_its_kernels():
     agent.current = types.SimpleNamespace(
         id=7, run_id="r-001", store="store", rendezvous=None, outputs=[], stop_requested_at=None,
         process=types.SimpleNamespace(poll=lambda: 0), serve_when_ready=lambda: None, kill=lambda: None,
-        close=lambda: None, fault=lambda: None, python=lambda: "python",
+        close=lambda: None, fault=lambda: None, python=lambda: "python", job_token="gzjt_seven",
         push_caches=lambda _config: pushed.append(True),
     )
     agent.send_logs = lambda: None
@@ -498,6 +505,17 @@ def test_a_refused_end_still_ships_the_run_and_its_kernels():
     assert agent.current is None
     assert "store" in agent.to_ship and agent.ship_python["store"] == "python"
     assert pushed == [True]
+    # `ravex ship` runs the job's Ravex, so with the job's token, not the agent's (GPU-530).
+    started = []
+    agent.config.token = "agent-token"
+    smith.subprocess.Popen, real = (lambda command, **kwargs: started.append(kwargs["env"]) or
+                                    types.SimpleNamespace(poll=lambda: None)), smith.subprocess.Popen
+    try:
+        agent.to_ship["store"] = 0.0
+        agent.ship()
+    finally:
+        smith.subprocess.Popen = real
+    assert started[0]["RAVEX_METRICS_TOKEN"] == "gzjt_seven" and "agent-token" not in started[0].values()
 
 
 def test_a_job_that_cannot_start_is_said_failed_through_a_backend_that_fails_once(monkeypatch):

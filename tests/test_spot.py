@@ -141,7 +141,7 @@ def _running():
         push_while_running=lambda _config: None,
         serve_when_ready=lambda: None,
         fault=lambda: None,
-        python=lambda: "python",
+        python=lambda: "python", job_token="gzjt_seven",
     )
 
     def stop(reason="cancelled by the backend"):

@@ -23,8 +23,8 @@ would be a remote shell on every training machine.
 - ``RAVEX_FORK_FROM`` and ``RAVEX_FORK_STEP`` for a fork, which is a fresh
   run of its own starting from another run's checkpoint;
 - ``RAVEX_METRICS_ENDPOINT``: the backend, so Ravex sends the run there while
-  it trains, and ``RAVEX_METRICS_TOKEN`` with the agent's token when
-  the backend asks for one.
+  it trains, and ``RAVEX_METRICS_TOKEN`` with the job's own token, the one
+  the claim's answer carries (``job_token``), never the agent's.
 
 **Code from a repository.** An agent started with ``code = true`` (or
 ``SMITH_CODE=1``) also takes jobs that carry ``code``: a repository over
@@ -76,12 +76,18 @@ this agent's token, not the provider's key that deletes the machine
 (``RUNPOD_API_KEY``, ``CONTAINER_API_KEY``), not its bucket's keys unless the
 job's store is there. What a job needs comes with the job. The job still runs
 as this agent's user, and could read the agent's own environment under
-``/proc``; and the token it reports its metrics with is this agent's, until a
-backend hands one per job.
+``/proc``.
 
 **The token.** ``SMITH_TOKEN`` in the environment (or ``token`` in the
 configuration, for a machine where that is how secrets arrive): sent as a
-bearer token on every call, and handed to the runs and to ``ravex ship``.
+bearer token on every call of this agent's own - heartbeat, claim, reports,
+logs. Never to the job's process, ``ravex ship`` or the kernels' push, which
+run the job's packages: a dependency of the job that had it could claim the
+next job, secrets and all. Those get the job's own token from the claim's
+answer (``job_token``), which the backend lets write that job's run and its
+workspace's cache and nothing else, for a few hours past the job's end. A
+claim answered without one, by a backend from before job tokens, fails the
+job rather than hand the agent's token over.
 
 **On a rented pod** one image serves every machine, so what differs between
 them comes from the environment and wins over the file: ``SMITH_BACKEND``,
@@ -155,16 +161,12 @@ is said in the job's output and costs nothing but the compilation.
 
 With ``cache = "backend"`` (or ``SMITH_CACHE=backend``) the cache is the
 backend's instead, and this machine holds no key to it (GPU-200): ``ravex
-cache`` asks the backend, with this agent's token, to sign each operation
+cache`` asks the backend, with the job's token, to sign each operation
 (``POST /api/cache/{scope}``). It pulls from ``global``, which machines may
 only read, then from ``workspace``, the job's owner's own, and pushes only
-there. The token is this agent's own, which the run already has for its
-metrics (``RAVEX_METRICS_TOKEN``) and could read here anyway: the training
-runs as the same user in the same container, and the token is in this
-agent's environment. What keeps the cache safe is not who holds the token
-but what the backend lets a workspace do with it - read ``global``, write
-only its own, up to its quota - so a script, or a library it imports, can
-reach no further than its owner's own cache.
+there. What keeps the cache safe is what the backend lets a workspace do -
+read ``global``, write only its own, up to its quota - so a script, or a
+library it imports, can reach no further than its owner's own cache.
 
 The ``global`` part is filled by the backend's builder (``builder.py``,
 GPU-202), never by a node. After the install this machine reports, by name,
@@ -1455,6 +1457,17 @@ class Running:
         self.hidden = dict(self.secrets)
         if config.token:
             self.hidden["SMITH_TOKEN"] = config.token
+        #: What the job's process, ``ravex ship`` and the kernels' push call
+        #: the backend with: the job's own token, worth its run and its
+        #: workspace's cache (GPU-530). Never this agent's, which claims jobs:
+        #: a backend that hands none gets the job failed, not the agent's
+        #: token in its place.
+        self.job_token = str(job.get("job_token") or "")
+        if config.token and not self.job_token:
+            raise RuntimeError("the backend handed no token for the job (job_token), and this agent gives "
+                               "a job none of its own; the backend is older than this agent")
+        if self.job_token:
+            self.hidden["JOB_TOKEN"] = self.job_token
         if token:
             self.hidden["RAVEX_JOB_TOKEN"] = token
         if bucket is not None and bucket.access_key and bucket.secret_key:
@@ -1483,13 +1496,13 @@ class Running:
         self.wheels = os.path.join(config.runs, "_cache", "wheels")
         self.wheels_store = ""
         self.wheels_report = ""
-        if self.code is not None and config.cache_service and config.token:
+        if self.code is not None and config.cache_service and self.job_token:
             signed = "sign+%s/api/cache/" % config.backend
             self.cache_reads = [signed + "global", signed + "workspace"]
             self.cache_store = signed + "workspace"
             self.wheels_store = signed + "global"
             self.wheels_report = "%s/api/cache-builds" % config.backend
-            self.cache_env = {"SMITH_CACHE_TOKEN": config.token}
+            self.cache_env = {"SMITH_CACHE_TOKEN": self.job_token}
             env.update(self.cache_env)
         # Not with temporary keys: a backend hands them scoped to the runs'
         # prefix, and they would not reach _cache.
@@ -1504,8 +1517,8 @@ class Running:
             self.cache_env["SMITH_CACHE_PATH_STYLE"] = "true" if own.path_style else "false"
             env.update(self.cache_env)
         env["RAVEX_METRICS_ENDPOINT"] = config.backend
-        if config.token:
-            env["RAVEX_METRICS_TOKEN"] = config.token
+        if self.job_token:
+            env["RAVEX_METRICS_TOKEN"] = self.job_token
         if config.price_per_hour:
             env["RAVEX_PRICE_PER_HOUR"] = str(config.price_per_hour)
         source = ""
@@ -1641,7 +1654,7 @@ class Running:
                 "envs": envs,
                 "environment_script": ENVIRONMENT_SCRIPT,
                 "locks": config.locks,
-                "signed": "%s/api/cache/global" % config.backend if config.cache_service and config.token else None,
+                "signed": "%s/api/cache/global" % config.backend if config.cache_service and self.job_token else None,
                 "gpu": config.hardware.startswith("gpu"),
                 "gpu_check": config.check_gpus,
                 "gpu_check_script": _GPU_CHECK,
@@ -1667,10 +1680,10 @@ class Running:
                 "wheels_report": self.wheels_report,
             }
         )
-        if config.cache_service and config.token:
+        if config.cache_service and self.job_token:
             # The runtime's wheels come from the backend's cache, through URLs
-            # it signs for this token (``runtime.py --signed``).
-            self.cache_env.setdefault("SMITH_CACHE_TOKEN", config.token)
+            # it signs for the job's token (``runtime.py --signed``).
+            self.cache_env.setdefault("SMITH_CACHE_TOKEN", self.job_token)
         if self.code is not None and self.code.get("token"):
             env["SMITH_GIT_TOKEN"] = str(self.code["token"])
         command = [config.python, "-c", _PREPARE]
@@ -1915,13 +1928,13 @@ class Agent:
         #: next try waits, doubled each time, and until when.
         self.logs_wait = 0.0
         self.logs_after = 0.0
-        #: `ravex ship` reads the token from here, not from its command line,
-        #: where any user of the machine can see it; and no other secret of
-        #: this agent's, since it runs the job's Ravex, from the job's
-        #: environment (GPU-530).
+        #: `ravex ship` reads the token from its environment, not from its
+        #: command line, where any user of the machine can see it: the job's
+        #: own, per store (``ship_token``), and no secret of this agent's,
+        #: since it runs the job's Ravex, from the job's environment (GPU-530).
         self._ship_env = without_secrets(os.environ)
-        if config.token:
-            self._ship_env["RAVEX_METRICS_TOKEN"] = config.token
+        #: Per store, the token of the job that trained it.
+        self.ship_token: Dict[str, str] = {}
         #: Kernels of finished jobs on their way to their caches.
         self.pushing: List[subprocess.Popen] = []
         #: What is wrong with this machine, when its GPUs failed the check:
@@ -2134,6 +2147,7 @@ class Agent:
                 # With the training's own Python, which has Ravex.
                 self.to_ship[running.store] = time.monotonic()
                 self.ship_python[running.store] = python
+                self.ship_token[running.store] = running.job_token
             pushing = running.push_caches(self.config)
             if pushing is not None:
                 self.pushing.append(pushing)
@@ -2222,6 +2236,7 @@ class Agent:
             if code == 0:
                 del self.to_ship[store]
                 self.ship_python.pop(store, None)
+                self.ship_token.pop(store, None)
                 if not first:
                     log("what %s had left reached the backend" % store)
             else:
@@ -2245,7 +2260,7 @@ class Agent:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
-                    env=self._ship_env,
+                    env=dict(self._ship_env, RAVEX_METRICS_TOKEN=self.ship_token.get(store, "")),
                 )
                 self.shipping = (store, process, due >= 0)
                 return

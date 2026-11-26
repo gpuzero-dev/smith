@@ -98,16 +98,18 @@ uploads. A 503 means the backend keeps no cache, and there is nothing to fill.
 
 ## What it expects of a backend
 
-JSON over HTTP, with `Authorization: Bearer <SMITH_TOKEN>` when a token is set:
+JSON over HTTP, with `Authorization: Bearer <SMITH_TOKEN>` when a token is set
+on smith's own calls; the job's process calls with the job's token (below):
 
 | call | what for |
 |---|---|
 | `POST /api/agents/heartbeat` | smith is alive, with its name, hardware and the scripts it can run; `fault`, when its GPUs failed the check below |
-| `POST /api/jobs/claim` | the next queued job this node can run, or nothing |
+| `POST /api/jobs/claim` | the next queued job this node can run, or nothing; with a token set, the job carries `job_token`, a token for that job's own process |
 | `PATCH /api/jobs/{id}` | a job's state: running, finished, failed, and the run id |
 | `POST /api/jobs/{id}/logs` | the job's output, numbered line by line |
 | `GET /api/jobs` | at start, jobs this node left running before a restart |
-| `POST /api/cache/{scope}` | only with `cache = "backend"`: `cache.py` asks it to sign each operation on the compiled-dependency cache, `global` (read) and `workspace` (read and write); see its `sign+https://` store |
+| `POST /api/cache/{scope}` | only with `cache = "backend"`: `cache.py` asks it to sign each operation on the compiled-dependency cache, `global` (read) and `workspace` (read and write); see its `sign+https://` store. With the job's token |
+| `POST /api/ingest/runs...` | Ravex's own calls, from the job's process and `ravex ship`, with the job's token |
 
 A claimed job may carry `secrets`, an object of names and values - an
 `HF_TOKEN`, a W&B key. smith puts them in that job's process environment only,
@@ -124,9 +126,15 @@ name has a part `KEY`, `SECRET`, `TOKEN`, `PASSWORD` or `CREDENTIALS`
 `AWS_SECRET_ACCESS_KEY`) reaches a job, `ravex ship` or the push of its
 kernels, which all run the job's packages. The agent's bucket keys go only to
 a job whose store is in the agent's bucket; a secret a job needs comes with
-the job. What this does not yet cover: the job runs as the agent's user, and
-it reports its metrics with the agent's own token (`RAVEX_METRICS_TOKEN`)
-until a backend hands one per job.
+the job. The job, `ravex ship` and the kernels' push call the backend with
+the job's own token, `job_token` in the claim's answer, as
+`RAVEX_METRICS_TOKEN` and `SMITH_CACHE_TOKEN`: the agent's token claims jobs,
+and a dependency of the job that held it could take the next one. A backend
+is expected to let that token write the job's run and its workspace's cache
+and nothing else, for a while after the job ends, since `ravex ship` and the
+push run then; a claim answered without one, with a token set, fails the job
+rather than hand the agent's over. What this does not yet cover: the job
+runs as the agent's user.
 
 A claimed job may also carry `storage`, a bucket with its keys
 (`type`, `bucket`, `prefix`, `endpoint`, `region`, `path_style`, `access_key`,
