@@ -88,7 +88,9 @@ home, its uv cache, its kernels' caches, which are pulled from and pushed to
 its owner's cache as before but no longer shared with the machine's other
 jobs. ``ravex ship``, the kernels' push and the rendezvous run as the job's
 user too, since they run the job's Python; the next job is taken only once
-they are over, and starts by killing every process of that user. An agent
+they are over, and starts by killing every process of that user. So does
+the job's end, but for its rendezvous: torchrun starts each rank in a
+session of its own, which the kill of the job's group does not reach. An agent
 that is not root on Linux and is given a job user refuses to start, rather
 than run the job as itself. Without the setting, as on a person's own
 machine, the job runs as the agent's user, can read its environment, and
@@ -127,7 +129,9 @@ job the same way, and waits for it, when it is itself told to stop
 process group of its own, and would otherwise die with the container, its
 last checkpoint unwritten. A job that ends by itself takes its group with it
 too: whatever its process left running there - a TensorBoard, a profiler, a
-rank - would keep its GPU memory from the next job (GPU-530).
+rank - would keep its GPU memory from the next job (GPU-530). Under torchrun
+the ranks are each in a session of their own, out of the group's reach;
+only with a job user of its own, whose every process goes, do they go too.
 
 **A bucket without keys (GPU-331).** A job's storage on AWS may come with a
 region and no keys: the node's instance role writes the bucket, and the run is
@@ -978,10 +982,8 @@ def as_user(identity: Optional[Tuple[int, int]]) -> Dict[str, Any]:
 
 #: Kills every process of the user it runs as (GPU-530): ``kill(-1)`` reaches
 #: all a process may signal, which for a user that is not root is its own,
-#: and on Linux never the caller. Run as the job's user before a job starts,
-#: so nothing a previous job left - a daemon that left its group with
-#: ``setsid``, which a ``killpg`` does not reach - runs beside the next one
-#: under the same uid, where it could read that job's environment.
+#: and on Linux never the caller. The preparer runs it as the job's user once
+#: a repository's install is over, before the environment it made is sealed.
 _KILL_USER = r"""
 import os, signal
 try:
@@ -1011,10 +1013,29 @@ for top in sys.argv[1:]:
 """
 
 
-def kill_user(identity: Optional[Tuple[int, int]]) -> None:
-    """Kill every process of the job's user (``_KILL_USER``)."""
-    if identity is not None:
-        subprocess.run([sys.executable, "-I", "-c", _KILL_USER], stdin=subprocess.DEVNULL, **as_user(identity))
+def kill_user(identity: Optional[Tuple[int, int]], spare: Tuple[int, ...] = ()) -> None:
+    """Kill every process of the job's user but those in the sessions
+    ``spare`` names (GPU-530). What a ``killpg`` of the job's group does not
+    reach: torchrun starts each rank in a session of its own, so its ranks
+    and whatever they started outlived a SIGKILL of torchrun and kept their
+    GPU memory; and a daemon that left with ``setsid`` would run beside the
+    next job, under the same uid, where it could read that job's environment.
+    By the real uid in ``/proc/<pid>/status``, which a process cannot hide
+    the way it can make its ``/proc`` folder root's."""
+    if identity is None:
+        return
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/status" % name, encoding="utf-8") as handle:
+                uids = next(line for line in handle if line.startswith("Uid:")).split()[1:]
+            with open("/proc/%s/stat" % name, encoding="utf-8") as handle:
+                session = int(handle.read().rsplit(")", 1)[1].split()[3])
+            if str(identity[0]) in uids and session not in spare:
+                os.kill(int(name), signal.SIGKILL)
+        except (OSError, StopIteration, ValueError, IndexError):
+            continue
 
 
 def runtimes_of(locks: str) -> Tuple[List[str], str]:
@@ -1980,7 +2001,10 @@ class Running:
             stdout=self._rendezvous_log,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            # With the job's Python, so as the job's user (GPU-530).
+            # With the job's Python, so as the job's user (GPU-530), and in a
+            # session of its own: the one spared when the job's end kills
+            # every other process of that user.
+            start_new_session=True,
             **self.as_job,
         )
         log("job %d: serving the run's rendezvous on port %d, pid %d" % (self.id, self.serve_port, self.rendezvous.pid))
@@ -2033,6 +2057,11 @@ class Running:
                 os.killpg(self.process.pid, signal.SIGKILL)
         except OSError:
             pass
+        # torchrun's ranks are in sessions of their own, out of the group's
+        # reach: with a job user, everything of that user goes but the run's
+        # rendezvous, which the other nodes still need (GPU-530).
+        rendezvous = getattr(self, "rendezvous", None)
+        kill_user(getattr(self, "identity", None), (rendezvous.pid,) if rendezvous is not None else ())
 
     def tail(self, lines: int = 6) -> str:
         """The end of the output: on a failure, usually the line that says why.

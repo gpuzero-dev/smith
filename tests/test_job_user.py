@@ -6,7 +6,7 @@ cannot read the agent's environment under /proc nor signal it; it cannot
 write smith's files, the template environments, a repository's checkout or
 the virtual environment made for it, nor the machine's shared caches; it can
 write its store, its own folder and its output; its group dies when it ends
-or is stopped, and what left the group dies before the next job starts. An
+or is stopped, and so does what left the group, as torchrun's ranks do. An
 agent that cannot start a job as another user refuses to, rather than run it
 as itself. Elsewhere - Windows, a user that is not root - only that refusal
 is checked.
@@ -193,13 +193,12 @@ def test_a_job_runs_as_its_own_user_and_reaches_only_what_is_its_own(runs):
             assert info.st_uid == os.getuid(), path
             assert stat.S_ISLNK(info.st_mode) or not info.st_mode & 0o7022, path
 
-    # Its group goes with it; what left the group goes before the next job.
+    # Its group goes with it, and so does what left the group: torchrun's
+    # ranks are each in a session of their own.
     agent.current = running
     agent.watch()
-    assert _until(lambda: _gone(seen["group"]))
-    assert not _gone(seen["escaped"])
+    assert _until(lambda: _gone(seen["group"]) and _gone(seen["escaped"]))
     again, second, _log = _code_job(config, runs, 2)
-    assert _gone(seen["escaped"])
     # The same environment again, still not the job's to write.
     assert second["prefix"] == seen["prefix"] and second["write"]["venv"] is False
     assert not os.path.exists(running.job_dir)
@@ -250,3 +249,23 @@ def test_runs_a_job_user_wrote_are_made_the_agents(runs):
     for path in (runs, runs / "_envs", envs, planted):
         info = os.lstat(path)
         assert info.st_uid == os.getuid() and not info.st_mode & 0o7022, path
+
+
+@needs_job_user
+def test_the_end_of_a_job_spares_its_rendezvous_alone():
+    """The other nodes of the run still read their peers from it (GPU-186);
+    every other process of the job's user goes."""
+    import subprocess
+
+    job = _job_user()
+    user = smith.as_user((job.pw_uid, job.pw_gid))
+    rendezvous = subprocess.Popen(["sleep", "300"], start_new_session=True, **user)
+    other = subprocess.Popen(["sleep", "300"], start_new_session=True, **user)
+    ended = subprocess.Popen(["true"], start_new_session=True, **user)
+    ended.wait()
+    running = types.SimpleNamespace(process=ended, rendezvous=rendezvous, identity=(job.pw_uid, job.pw_gid))
+    smith.Running.kill(running)
+    assert _until(lambda: other.poll() is not None)
+    assert rendezvous.poll() is None
+    rendezvous.kill()
+    rendezvous.wait()
