@@ -2077,7 +2077,13 @@ class Agent:
             else:
                 state, message = "failed", "exit code %d\n%s" % (code, running.tail())
             log("job %d %s (exit code %d)" % (running.id, "stopped" if running.stop_requested_at else state, code))
-            self._report_until_heard(running.id, state, message, running.run_id)
+            try:
+                self._report_until_heard(running.id, state, message, running.run_id)
+            except Refusal as exc:
+                # A backend that refuses the end (a 404, a 401) still gets the
+                # run's metrics below (GPU-530): raised, it skipped them, and
+                # what Ravex kept on disk through an outage was never sent.
+                log("job %d: the backend refused its end (%s)" % (running.id, exc))
             # Always, not only after an outage: it is how the final status
             # arrives when the run's own last attempt did not, and on a store
             # with nothing left it sends the run document again and no points.

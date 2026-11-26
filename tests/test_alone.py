@@ -429,6 +429,29 @@ def test_the_end_of_a_job_is_said_again_through_a_backend_that_is_failing(monkey
         agent._report_until_heard(1, "finished", None, "r-001")
 
 
+def test_a_refused_end_still_ships_the_run_and_its_kernels():
+    """A 404 or 401 on the final report skipped `ravex ship` and the cache's
+    push, and the metrics Ravex kept through an outage were lost (GPU-530)."""
+    agent = _agent()
+    pushed = []
+    agent.current = types.SimpleNamespace(
+        id=7, run_id="r-001", store="store", rendezvous=None, outputs=[], stop_requested_at=None,
+        process=types.SimpleNamespace(poll=lambda: 0), serve_when_ready=lambda: None, kill=lambda: None,
+        close=lambda: None, fault=lambda: None, python=lambda: "python",
+        push_caches=lambda _config: pushed.append(True),
+    )
+    agent.send_logs = lambda: None
+
+    def refused(*_args):
+        raise smith.Refusal("PATCH /api/jobs/7: 404", 404)
+
+    agent._report_until_heard = refused
+    agent.watch()
+    assert agent.current is None
+    assert "store" in agent.to_ship and agent.ship_python["store"] == "python"
+    assert pushed == [True]
+
+
 def test_no_job_is_taken_until_the_old_ones_are_closed(monkeypatch):
     """Asked once, at a start the backend missed, the jobs an earlier start
     left were never closed (GPU-474)."""
