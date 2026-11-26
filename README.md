@@ -133,8 +133,20 @@ and a dependency of the job that held it could take the next one. A backend
 is expected to let that token write the job's run and its workspace's cache
 and nothing else, for a while after the job ends, since `ravex ship` and the
 push run then; a claim answered without one, with a token set, fails the job
-rather than hand the agent's over. What this does not yet cover: the job
-runs as the agent's user.
+rather than hand the agent's over.
+
+The job runs as a user of its own when `SMITH_JOB_USER` names one (both
+images set `job`, and run smith as root): its process cannot read smith's
+environment under `/proc`, signal smith, or write smith's files, the
+template environments in `_envs`, a repository's checkout or the virtual
+environment made for it in `_code` - all of which the next job runs. It
+writes its run's store, its output, and `_jobs/<id>`, its home and its own
+caches of compiled kernels and wheels, pulled from its owner's cache before
+it starts. smith has to be root for that, on Linux; given a job user
+otherwise it does not start, and says why. Without `SMITH_JOB_USER` - a
+person's own machine, Windows and macOS included - the job runs as smith's
+own user, and could read smith's token the same way: the machine is that
+person's, and so is the job.
 
 A claimed job may also carry `storage`, a bucket with its keys
 (`type`, `bucket`, `prefix`, `endpoint`, `region`, `path_style`, `access_key`,

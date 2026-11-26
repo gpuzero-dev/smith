@@ -74,9 +74,25 @@ name has a part ``KEY``, ``SECRET``, ``TOKEN``, ``PASSWORD`` or
 ``CREDENTIALS`` reaches the job, ``ravex ship`` or the kernels' push: not
 this agent's token, not the provider's key that deletes the machine
 (``RUNPOD_API_KEY``, ``CONTAINER_API_KEY``), not its bucket's keys unless the
-job's store is there. What a job needs comes with the job. The job still runs
-as this agent's user, and could read the agent's own environment under
-``/proc``.
+job's store is there. What a job needs comes with the job.
+
+**The job's own user (GPU-530).** With ``SMITH_JOB_USER`` (``job_user`` in
+the file; ``job`` in both images) the training runs as that user and this
+agent as root: a dependency of the job can then neither read the agent's
+environment under ``/proc`` - its token, the machine's keys - nor signal it,
+nor write what the next job runs: smith's own files, the template
+environments under ``_envs``, a repository's checkout and its virtual
+environment under ``_code``. The job writes its store, its output (through
+the descriptors the agent opened) and its own folder ``_jobs/<id>`` - its
+home, its uv cache, its kernels' caches, which are pulled from and pushed to
+its owner's cache as before but no longer shared with the machine's other
+jobs. ``ravex ship``, the kernels' push and the rendezvous run as the job's
+user too, since they run the job's Python; the next job is taken only once
+they are over, and starts by killing every process of that user. An agent
+that is not root on Linux and is given a job user refuses to start, rather
+than run the job as itself. Without the setting, as on a person's own
+machine, the job runs as the agent's user, can read its environment, and
+shares its caches: the machine is that person's, and so is the job.
 
 **The token.** ``SMITH_TOKEN`` in the environment (or ``token`` in the
 configuration, for a machine where that is how secrets arrive): sent as a
@@ -204,6 +220,7 @@ import json
 import os
 import random
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -460,6 +477,19 @@ _PARAM = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 #: reaches the training. What it made is written to the job's ``ready`` file,
 #: which the agent reads for the Python of the rendezvous, of ``ravex ship``
 #: and of the kernels' cache.
+#:
+#: **With a job user of its own** (GPU-530) it starts as the agent's user and
+#: makes as that user only what runs no code of the job's: the template's
+#: environment, from the versions it names, and the fetch of a commit, which
+#: runs nothing of it. What runs the job's code or writes the job's own
+#: folder - the GPU check, the copy of the checkout the training runs in,
+#: the install of a repository's requirements, whose builds are the
+#: repository's code, every pull and push of a cache - runs as the job's
+#: user. A repository's virtual environment is kept for the next job with
+#: the same commit, so once its install is over every process of the job's
+#: user is killed and the environment made the agent's, which the job can
+#: then read and not write. Only then does the preparer drop to the job's
+#: user and become the training.
 _PREPARE = r"""
 import base64, json, os, shutil, signal, subprocess, sys, time, urllib.request
 
@@ -498,6 +528,17 @@ def run(command, what, **kwargs):
         fail("could not " + what)
 
 
+# The job's user, when it has one (GPU-530): what starts a process as that
+# user, and nothing when the job runs as the agent's.
+job_user = spec["job_user"]
+as_job = {"user": job_user[0], "group": job_user[1], "extra_groups": []} if job_user else {}
+if job_user:
+    # What this process makes as the agent, the job's user must be able to
+    # read: an agent started with a stricter umask would leave the job no
+    # way into its own environment.
+    os.umask(0o022)
+
+
 # Pull or push some of the job's caches; a failure is said and passed. A pull
 # goes through every store in order, each adding what the directory lacks.
 def cache(action, python, names):
@@ -509,7 +550,7 @@ def cache(action, python, names):
             since = time.monotonic()
             done = subprocess.run([python, spec["cache_script"], action, "--name", name, "--dir", directory,
                                    "--store", store, "--with", library],
-                                  stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env))
+                                  stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env), **as_job)
             if done.returncode != 0:
                 say("the %s cache was not %s after %.1f s; what it would have held is compiled here" % (
                     name, "used" if action == "pull" else "sent", time.monotonic() - since))
@@ -527,7 +568,7 @@ def wheels_pull(python):
     since = time.monotonic()
     done = subprocess.run([python, spec["cache_script"], "pull", "--name", "wheels",
                            "--dir", spec["wheels"], "--store", spec["wheels_store"]],
-                          stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env))
+                          stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env), **as_job)
     if done.returncode != 0:
         say("the builder's wheels were not used after %.1f s; what they would have been is compiled here"
             % (time.monotonic() - since))
@@ -555,7 +596,8 @@ def wheels_report(python):
         return
     try:
         key = json.loads(subprocess.run([python, spec["cache_script"], "key", "--name", "wheels"],
-                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True).stdout)
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True,
+                                        **as_job).stdout)
         body = json.dumps({"key": key, "wheels": [{"name": n, "version": v} for n, v in sorted(built)]}).encode()
         request = urllib.request.Request(spec["wheels_report"], data=body, method="POST", headers={
             "Content-Type": "application/json", "User-Agent": "smith",
@@ -579,7 +621,10 @@ if spec["signed"]:
     command += ["--signed", spec["signed"]]
 if spec["gpu"]:
     command += ["--gpu"]
-if subprocess.run(command, stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env)).returncode != 0:
+# uv's cache of the agent's, not the job's own: what makes the template's
+# environment is shared by every job with the same template.
+if subprocess.run(command, stdin=subprocess.DEVNULL,
+                  env=dict(os.environ, UV_CACHE_DIR=spec["shared_uv"], **cache_env)).returncode != 0:
     fail("could not make the job's libraries")
 with open(made, encoding="utf-8") as handle:
     made_here = json.load(handle)
@@ -593,8 +638,10 @@ took("libraries ready", began)
 if spec["gpu_check"] and not os.path.isfile(spec["gpu_checked"]):
     since = time.monotonic()
     try:
+        # As the training will run: a GPU root reaches and the job's user does
+        # not is a machine that cannot train.
         done = subprocess.run([python, "-c", spec["gpu_check_script"], str(spec["gpus"])], stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=spec["gpu_check_seconds"])
+                              capture_output=True, text=True, timeout=spec["gpu_check_seconds"], **as_job)
         said = [line for line in (done.stdout or "").splitlines() if line.strip()] or [
             line for line in (done.stderr or "").splitlines() if line.strip()]
         last, ok = (said[-1] if said else "no answer"), done.returncode == 0
@@ -636,6 +683,14 @@ if spec["code"]:
         run(["git", "-C", tree, "checkout", "-q", "--detach", "FETCH_HEAD"], "check out " + short, env=env)
         open(fetched, "w").close()
         took("fetched", since)
+    # With a user of its own the job runs in a copy of the checkout, its own
+    # to write: the checkout is the agent's, the next job with the same
+    # commit runs it, and a build writes into the tree it builds.
+    own = spec["own_code"] or tree
+    if spec["own_code"]:
+        run([sys.executable, "-I", "-c", "import shutil, sys; shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True, "
+             "ignore=shutil.ignore_patterns('.smith-*'), dirs_exist_ok=True)", tree, own],
+            "copy the checkout for the job", **as_job)
     if os.path.isfile(ready):
         with open(ready, encoding="utf-8") as handle:
             python = json.load(handle)["python"]
@@ -648,8 +703,14 @@ if spec["code"]:
             "pyproject.toml" if os.path.isfile(os.path.join(tree, "pyproject.toml")) else None)
         if wants:
             venv = os.path.join(tree, ".smith-venv-" + flavour)
+            if job_user:
+                # Made new, by the job's user, who builds what it installs; a
+                # half-made one from a job that stopped is not built upon.
+                shutil.rmtree(venv, ignore_errors=True)
+                os.makedirs(venv)
+                os.chown(venv, job_user[0], job_user[1])
             # On top of the template's Python, whose torch and Ravex it sees.
-            run([python, "-m", "venv", "--system-site-packages", venv], "make a virtual environment")
+            run([python, "-m", "venv", "--system-site-packages", venv], "make a virtual environment", **as_job)
             python = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv, "bin", "python")
             what = ["-r", "requirements.txt"] if wants == "requirements.txt" else ["."]
             say("installing what %s asks for" % wants)
@@ -658,17 +719,23 @@ if spec["code"]:
             find_links = ["--find-links", spec["wheels"]] if os.path.isdir(spec["wheels"]) and os.listdir(spec["wheels"]) else []
             since = time.monotonic()
             run([shutil.which("uv") or "uv", "pip", "install", "--python", python] + find_links + what,
-                "install the dependencies", cwd=tree)
+                "install the dependencies", cwd=own, **as_job)
             took("installed", since)
             if spec["cache_store"]:
                 # What it downloaded is out, what it built stays: the cache is
                 # then only the wheels nobody publishes for this machine.
-                subprocess.run([shutil.which("uv") or "uv", "cache", "prune", "--ci", "-q"], stdin=subprocess.DEVNULL)
+                subprocess.run([shutil.which("uv") or "uv", "cache", "prune", "--ci", "-q"], stdin=subprocess.DEVNULL,
+                               **as_job)
                 cache("push", python, ("uv",))
                 wheels_report(python)
+            if job_user:
+                # Nothing the install started is left to write it, and then it
+                # is the agent's: the next job with this commit runs it.
+                run([sys.executable, "-I", "-c", spec["kill_user"]], "stop what the install left running", **as_job)
+                run([sys.executable, "-I", "-c", spec["seal"], venv], "keep the virtual environment from the job")
         with open(ready, "w", encoding="utf-8") as handle:
             json.dump({"python": python}, handle)
-    root = os.path.realpath(tree)
+    root = os.path.realpath(own)
     script = os.path.realpath(os.path.join(root, spec["script"]))
     # Inside the checkout and a file of it: a link that leads out is refused too.
     if os.path.commonpath([script, root]) != root or not os.path.isfile(script):
@@ -705,6 +772,12 @@ else:
 command += spec["flags"]
 say("running %s, %.1f s after the job started" % (os.path.basename(script), time.monotonic() - began))
 os.chdir(root)
+if job_user:
+    # The training as the job's user, and nothing of the agent's with it: no
+    # group of the agent's, no way back (GPU-530).
+    os.setgroups([])
+    os.setgid(job_user[1])
+    os.setuid(job_user[0])
 if os.name == "nt":
     # No exec on Windows: wait for the training, and leave a stop to it.
     for name in ("SIGBREAK", "SIGINT"):
@@ -776,6 +849,10 @@ class Config:
     #: says so: a job is told it as ``RAVEX_PRICE_PER_HOUR``, and the run
     #: reports its cost per token. None says nothing.
     price_per_hour: Optional[float] = None
+    #: The user the job's process runs as (``SMITH_JOB_USER``), when not this
+    #: agent's own: see "The job's own user" above. Empty runs the job as
+    #: this agent's user, which is what a person's own machine does.
+    job_user: str = ""
 
     @classmethod
     def load(cls, path: str) -> "Config":
@@ -825,7 +902,7 @@ class Config:
             [str(python) for python in raw.get("pythons") or []], str(raw.get("torch") or ""))
         if not pythons or not torch:
             raise SystemExit("%s says no Pythons or PyTorch a job may ask for: locks, or pythons and torch" % path)
-        return cls(
+        config = cls(
             backend=str(env("SMITH_BACKEND") or raw.get("backend", "http://127.0.0.1:8600")).rstrip("/"),
             name=str(env("SMITH_NAME") or raw.get("name") or socket.gethostname()),
             hardware=str(env("SMITH_HARDWARE") or raw.get("hardware", "local-cpu")),
@@ -854,7 +931,90 @@ class Config:
             torch=torch,
             alone_minutes=max(0.0, float(env("SMITH_ALONE_MINUTES") or raw.get("alone_minutes", 0) or 0)),
             price_per_hour=float(env("SMITH_PRICE_PER_HOUR") or raw.get("price_per_hour", 0) or 0) or None,
+            job_user=str(env("SMITH_JOB_USER") or raw.get("job_user") or ""),
         )
+        try:
+            job_identity(config)
+        except RuntimeError as exc:
+            # Refused here, not at the first job: an agent told to run jobs
+            # as another user that cannot would otherwise claim jobs and fail
+            # every one of them.
+            raise SystemExit(str(exc))
+        return config
+
+
+def job_identity(config: Config) -> Optional[Tuple[int, int]]:
+    """The uid and gid the job's process runs as, or None for this agent's
+    own (GPU-530). Never silently the agent's when another was asked for: a
+    machine set up to keep the job away from the agent's token and files
+    that cannot is refused, not run as if it could."""
+    if not config.job_user:
+        return None
+    if os.name == "nt" or not os.path.isdir("/proc") or os.geteuid() != 0:
+        raise RuntimeError(
+            "SMITH_JOB_USER is %r, and only an agent running as root on Linux can start a job as "
+            "another user; run the agent as root, or unset SMITH_JOB_USER to run jobs as this "
+            "agent's own user" % config.job_user
+        )
+    import pwd
+
+    try:
+        entry = pwd.getpwnam(config.job_user)
+    except KeyError:
+        raise RuntimeError("SMITH_JOB_USER is %r, and this machine has no such user" % config.job_user) from None
+    if entry.pw_uid == 0:
+        raise RuntimeError("SMITH_JOB_USER is %r, which is root: a job would hold everything the agent does"
+                           % config.job_user)
+    return entry.pw_uid, entry.pw_gid
+
+
+def as_user(identity: Optional[Tuple[int, int]]) -> Dict[str, Any]:
+    """What ``subprocess.Popen`` takes to start a process as that user, with
+    none of this agent's supplementary groups; nothing for the agent's own."""
+    if identity is None:
+        return {}
+    return {"user": identity[0], "group": identity[1], "extra_groups": []}
+
+
+#: Kills every process of the user it runs as (GPU-530): ``kill(-1)`` reaches
+#: all a process may signal, which for a user that is not root is its own,
+#: and on Linux never the caller. Run as the job's user before a job starts,
+#: so nothing a previous job left - a daemon that left its group with
+#: ``setsid``, which a ``killpg`` does not reach - runs beside the next one
+#: under the same uid, where it could read that job's environment.
+_KILL_USER = r"""
+import os, signal
+try:
+    os.kill(-1, signal.SIGKILL)
+except ProcessLookupError:
+    pass
+"""
+
+#: Makes every path under the ones named the caller's, and writable by it
+#: alone (GPU-530): what the job's user wrote there - a repository's virtual
+#: environment, a runs volume from before the job had a user of its own -
+#: can no longer be changed by it. Links are handed over and never followed;
+#: set-user-ID and set-group-ID bits go too, or a file the job made would
+#: become a program of root's that anyone could run. Only once no process of
+#: the job's user is left, which could otherwise swap a path for a link
+#: between the check and the change.
+_SEAL = r"""
+import os, stat, sys
+uid, gid = os.getuid(), os.getgid()
+for top in sys.argv[1:]:
+    for folder, dirs, files in os.walk(top):
+        for path in [folder] + [os.path.join(folder, name) for name in dirs + files]:
+            mode = os.lstat(path).st_mode
+            os.lchown(path, uid, gid)
+            if not stat.S_ISLNK(mode):
+                os.chmod(path, stat.S_IMODE(mode) & 0o755)
+"""
+
+
+def kill_user(identity: Optional[Tuple[int, int]]) -> None:
+    """Kill every process of the job's user (``_KILL_USER``)."""
+    if identity is not None:
+        subprocess.run([sys.executable, "-I", "-c", _KILL_USER], stdin=subprocess.DEVNULL, **as_user(identity))
 
 
 def runtimes_of(locks: str) -> Tuple[List[str], str]:
@@ -1433,6 +1593,16 @@ class Running:
         script = config.scripts[job["script"]] if self.code is None else ""
         #: What it trains with (GPU-523), which this machine must be able to make.
         self.template = self._checked_template(job, config)
+        #: The user the job's process runs as, when not this agent's own
+        #: (GPU-530), and what starts a process as that user.
+        self.identity = job_identity(config)
+        self.as_job = as_user(self.identity)
+        #: With a user of its own, the job's own folder, the one place under
+        #: the runs it may write besides its store: its home and its caches.
+        #: Everything else under the runs - the environments, the checkouts
+        #: and their virtual environments, the logs - is the agent's, and a
+        #: job that could write it would run its code in the next job.
+        self.job_dir = os.path.join(config.runs, "_jobs", str(self.id)) if self.identity else ""
         env = without_secrets(os.environ)
         # The secrets a backend gave this job: its HF_TOKEN, its W&B key. In
         # the training process's environment only - never this agent's own,
@@ -1486,10 +1656,16 @@ class Running:
                 self.hidden["STORAGE_SESSION_TOKEN"] = bucket.session_token
         if self.code is not None and self.code.get("token"):
             self.hidden["GIT_TOKEN"] = str(self.code["token"])
-        #: The compiled directories, on this machine for every job.
-        self.caches = [
-            (name, os.path.join(config.runs, "_cache", name), library) for name, _variable, library in CACHES
-        ]
+        #: The compiled directories: on this machine for every job, or with a
+        #: job user of its own the job's alone (GPU-530). Shared, they were
+        #: kernels the next job loads and runs, written by whatever this one
+        #: ran: a job's kernels then come from its owner's cache, which is
+        #: pulled before it starts, and not from a machine's other jobs.
+        cache_root = os.path.join(self.job_dir, "cache") if self.identity else os.path.join(config.runs, "_cache")
+        self.caches = [(name, os.path.join(cache_root, name), library) for name, _variable, library in CACHES]
+        if self.identity:
+            # Its own, which uv and torch keep their caches under.
+            env["HOME"] = os.path.join(self.job_dir, "home")
         for (_name, directory, _library), (_same, variable, _lib) in zip(self.caches, CACHES):
             env[variable] = directory
         #: Where they are shared, for a job that runs a repository: the
@@ -1502,7 +1678,7 @@ class Running:
         #: The wheels the backend's builder compiled for machines like this
         #: one, handed to uv as ``--find-links``, and where to report the ones
         #: this machine still had to compile so the builder does them next.
-        self.wheels = os.path.join(config.runs, "_cache", "wheels")
+        self.wheels = os.path.join(cache_root, "wheels")
         self.wheels_store = ""
         self.wheels_report = ""
         if self.code is not None and config.cache_service and self.job_token:
@@ -1604,6 +1780,8 @@ class Running:
             raise RuntimeError("this agent does not know how to start a %r job" % job["mode"])
         env["RAVEX_STORAGE_PATH"] = store
         self.store = store
+        if self.identity:
+            self._hand_over(config, store)
         if job.get("config"):
             # Settings chosen for the run. RAVEX_OVERRIDE and not one
             # RAVEX_<NAME> each: those lose to the script's own decorator,
@@ -1627,6 +1805,12 @@ class Running:
             ranked = os.path.join(logs, "job-%d.rank%%d.log" % self.id)
             env["SMITH_RANK_LOG"] = ranked
             self.outputs += [LogTail(self.id, ranked % rank, self.hidden, rank) for rank in range(config.gpus)]
+            if self.identity:
+                # Made here and given to the job's user, which opens each from
+                # its rank: the folder they are in is the agent's.
+                for rank in range(config.gpus):
+                    open(ranked % rank, "ab").close()
+                    os.chown(ranked % rank, *self.identity)
         serve = outer.get("serve")
         if serve:
             port = int(serve)
@@ -1687,6 +1871,13 @@ class Running:
                 "wheels": self.wheels,
                 "wheels_store": self.wheels_store,
                 "wheels_report": self.wheels_report,
+                # The job's user, and what the preparer does as the agent
+                # before it becomes the training as that user (GPU-530).
+                "job_user": list(self.identity) if self.identity else None,
+                "shared_uv": os.path.join(config.runs, "_cache", "uv"),
+                "own_code": os.path.join(self.job_dir, "code") if self.identity and self.code is not None else None,
+                "kill_user": _KILL_USER,
+                "seal": _SEAL,
             }
         )
         if config.cache_service and self.job_token:
@@ -1716,6 +1907,29 @@ class Running:
             "job %d (%s, %s) started as run %s, pid %d; output in %s"
             % (self.id, job["name"], job["mode"], self.run_id, self.process.pid, self.log_path)
         )
+
+    def _hand_over(self, config: Config, store: str) -> None:
+        """Make what the job's user writes, and give it that user (GPU-530):
+        its own folder, made new, and its run's store. Nothing of a previous
+        job's is left running first, so none of it can be holding a path
+        that is about to change hands."""
+        kill_user(self.identity)
+        # Every job's, kernels included: their pushes are over, since no job
+        # is taken while one goes on (``Agent.takes_jobs``).
+        shutil.rmtree(os.path.join(config.runs, "_jobs"), ignore_errors=True)
+        for path in [os.path.join(self.job_dir, "home"), self.wheels] + [entry[1] for entry in self.caches]:
+            os.makedirs(path, exist_ok=True)
+        relative = os.path.relpath(store, config.runs).split(os.sep)
+        if relative[0].startswith(("_", ".")):
+            # A run's name never starts so; the agent's own folders do, and a
+            # job given one of them as its store would be given them.
+            raise RuntimeError("%r is not a run's store under this agent's runs" % store)
+        os.makedirs(store, exist_ok=True)
+        # The whole run, a resumed one as it was written before included.
+        for top in (self.job_dir, os.path.join(config.runs, relative[0])):
+            for folder, dirs, files in os.walk(top):
+                for path in [folder] + [os.path.join(folder, name) for name in dirs + files]:
+                    os.lchown(path, *self.identity)
 
     @staticmethod
     def _checked_template(job: Dict[str, Any], config: Config) -> Dict[str, str]:
@@ -1766,6 +1980,8 @@ class Running:
             stdout=self._rendezvous_log,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
+            # With the job's Python, so as the job's user (GPU-530).
+            **self.as_job,
         )
         log("job %d: serving the run's rendezvous on port %d, pid %d" % (self.id, self.serve_port, self.rendezvous.pid))
 
@@ -1878,7 +2094,11 @@ class Running:
                 stdout=out,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                # As the job's user, which owns the kernels it reads and whose
+                # Python it runs (GPU-530): as the agent, a link the job left
+                # among them would be followed with the agent's rights.
                 **extra,
+                **self.as_job,
             )
         finally:
             out.close()
@@ -1957,10 +2177,22 @@ class Agent:
         #: been closed; none is taken before, or its own would be among them.
         self.reconciled = False
         self.spot: Optional[SpotWatcher] = None
+        #: The user jobs run as, when not this agent's (GPU-530).
+        self.identity = job_identity(config)
 
     def takes_jobs(self) -> bool:
         """Whether to claim a job: not with a fault, and not on a machine
-        that is about to go, where it would start work to lose."""
+        that is about to go, where it would start work to lose.
+
+        With a job user of its own, not while what a finished job left -
+        ``ravex ship``, its kernels' push - still runs as that user either
+        (GPU-530): each runs that job's Python, and beside the next job,
+        under the same uid, it could read that job's environment. The next
+        job starts by killing every process of that user."""
+        if self.identity is not None and (
+            self.shipping is not None or any(process.poll() is None for process in self.pushing)
+        ):
+            return False
         return self.fault is None and not self.reclaimed.is_set() and self.reconciled
 
     def start_spot_watch(self) -> None:
@@ -2257,6 +2489,10 @@ class Agent:
                     )
                 self.to_ship[store] = -(time.monotonic() + SHIP_RETRY_SECONDS)
             return
+        if self.identity is not None and self.current is not None:
+            # A finished run's Python is not started beside the next job,
+            # under the same user (GPU-530): it is tried again once that ends.
+            return
         now = time.monotonic()
         for store, due in self.to_ship.items():
             # A negative time is a retry: the first failure was already said.
@@ -2270,6 +2506,9 @@ class Agent:
                     stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
                     env=dict(self._ship_env, RAVEX_METRICS_TOKEN=self.ship_token.get(store, "")),
+                    # The job's Python, reading the store the job wrote: as
+                    # the job's user, never the agent's (GPU-530).
+                    **as_user(self.identity),
                 )
                 self.shipping = (store, process, due >= 0)
                 return
@@ -2341,6 +2580,22 @@ class Agent:
                 except (Unreachable, RuntimeError):
                     pass
 
+    def seal_runs(self) -> None:
+        """Make the runs and the folders every job reads this agent's, where
+        they are not (GPU-530): a runs volume from an image whose jobs ran as
+        the agent's user, which the job's user now is, held environments,
+        checkouts and logs a job could rewrite. Each folder once, and only
+        when it is not the agent's already; a run's store is given to the
+        job's user when a job writes it."""
+        runs = self.config.runs
+        os.makedirs(runs, exist_ok=True)
+        tops = [runs] + [os.path.join(runs, name) for name in ("_envs", "_code", "_cache", "_logs")]
+        stale = [top for top in tops if os.path.exists(top) and os.lstat(top).st_uid != os.getuid()]
+        if stale:
+            log("making %s this agent's alone; a job's user wrote them" % ", ".join(stale))
+            kill_user(self.identity)
+            subprocess.run([sys.executable, "-I", "-c", _SEAL] + stale, check=True, stdin=subprocess.DEVNULL)
+
     def run(self) -> None:
         bucket = self.config.storage
         log(
@@ -2358,6 +2613,8 @@ class Agent:
                 else "s3://%s/%s, staged in %s" % (bucket.bucket, bucket.prefix, self.config.runs),
             )
         )
+        if self.identity is not None:
+            self.seal_runs()
         self.reconcile()
         self.start_spot_watch()
         polled = 0.0
