@@ -18,21 +18,22 @@ ENV PYTHONUNBUFFERED=1     PIP_DISABLE_PIP_VERSION_CHECK=1     PIP_NO_CACHE_DIR=
 # release at least two weeks old; Dependabot reads no pin in a RUN line.
 RUN pip install uv==0.13.8
 
-# smith and every job it starts run as `smith`, not root (GPU-403): a script
-# is code from a repository, and in a container that runs as root a mistake in
-# one, or a dependency that misbehaves, can do whatever root can there. The
-# user owns what a job writes - the runs (`runs` in smith.docker.toml), the
-# environments made under them, and its home, where uv and torch keep their
-# caches. A runs volume made by an image from before this one is root's:
-# `docker compose run --rm --user root <service> chown -R smith:smith /runs`
-# hands it over once.
-RUN useradd --create-home --uid 10001 --user-group smith     && mkdir -p /runs     && chown -R smith:smith /runs
-# smith's own files are root's, and only readable to `smith` (GPU-530): owned
+# Every job runs as `job`, never root (GPU-403) and never smith's own user
+# (GPU-530): a script is code from a repository, and a dependency of it that
+# misbehaves could otherwise do what root can here, or - as smith's user -
+# read smith's token under /proc and rewrite what the next job runs. smith
+# itself runs as root, which is what lets it start a process as another user
+# (SMITH_JOB_USER); it owns /runs and everything every job reads there, and
+# hands each job its store and its own folder. Same uid as the `smith` user
+# of the images before, so a runs volume they wrote is made smith's again
+# when it starts (Agent.seal_runs), not left writable by the jobs.
+RUN useradd --no-create-home --uid 10001 --user-group job && mkdir -p /runs
+ENV SMITH_JOB_USER=job
+# smith's own files are root's, and only readable to `job` (GPU-530): owned
 # by the user the jobs run as, a job could rewrite smith.py, cache.py or
 # environment.py, and the agent - or the next job - would run its code.
 COPY . /app/smith
 RUN chmod -R u=rwX,go=rX /app/smith
 WORKDIR /app
-USER smith
 
 CMD ["python", "smith/smith.py", "--config", "smith/smith.docker.toml"]

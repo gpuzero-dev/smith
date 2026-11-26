@@ -105,9 +105,13 @@ ENV CUDA_HOME=/usr/local/cuda-12.8     PATH="/usr/local/cuda-12.8/bin:${PATH}"
 # release at least two weeks old; Dependabot reads no pin in a RUN line.
 RUN pip install uv==0.13.8
 
-# Root's and read-only to anyone else (GPU-530), as in Dockerfile: here the
-# agent and the job both still run as root, so this holds only once the job
-# runs as a user of its own.
+# The job runs as `job` and smith as root (GPU-530), as in Dockerfile: a
+# dependency of the job can then neither read smith's token and the
+# machine's keys under /proc nor write what the next job runs. The GPUs are
+# the container toolkit's /dev/nvidia*, which any user may open.
+RUN useradd --no-create-home --uid 10001 --user-group job
+ENV SMITH_JOB_USER=job
+# Root's and read-only to anyone else (GPU-530), as in Dockerfile.
 COPY . /app/smith
 RUN chmod -R u=rwX,go=rX /app/smith
 # The locks of what a job's environment fetches (runtime.py), not the wheels.
