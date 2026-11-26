@@ -9,8 +9,7 @@ on:
   # Not deploy: there CD.yml runs this same CI before it builds the image,
   # and a second run on the same commit would only spend minutes.
   push:
-    branches-ignore: [deploy]
-  pull_request:
+    branches: [main]
   workflow_dispatch:
   # CD.yml runs it on the commit it builds, before the image is pushed.
   workflow_call:
