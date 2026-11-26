@@ -275,6 +275,52 @@ def test_a_job_is_not_given_what_is_the_agents_alone(tmp_path, monkeypatch):
     assert env["RAVEX_PRICE_PER_HOUR"] == "1.89"
 
 
+def _gone(pid):
+    """Whether ``pid`` is dead: a zombie nobody reaped counts, since it holds
+    nothing (without --init, pytest may be the container's PID 1)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        with open("/proc/%d/stat" % pid, encoding="utf-8") as handle:
+            return handle.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a job is a process group, POSIX's")
+def test_what_a_job_left_in_its_group_dies_when_it_ends(tmp_path):
+    """A child that outlived the job's process kept its CUDA context, and the
+    next job ran out of memory (GPU-530)."""
+    import sys
+
+    child = tmp_path / "child.pid"
+    script = tmp_path / "spawn.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        "open(%r, 'w').write(str(p.pid))\n" % str(child)
+    )
+    config = smith.Config(backend="http://127.0.0.1:1", name="n", hardware="h", runs=str(tmp_path / "runs"),
+                          python=sys.executable, scripts={"spawn": str(script)}, **RUNTIMES)
+    made(tmp_path / "runs")
+    job = {"id": 1, "script": "spawn", "mode": "fresh", "name": "n", "run_ref": "r-001", "params": {},
+           "template": TEMPLATE}
+    agent = smith.Agent(config)
+    agent.current = smith.Running(job, config)
+    agent.current.process.wait(timeout=60)
+    pid = int(child.read_text())
+    assert not _gone(pid)
+    agent.send_logs = lambda: None
+    agent._report_until_heard = lambda *args: None
+    agent.watch()
+    deadline = time.monotonic() + 10
+    while not _gone(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert _gone(pid)
+
+
 def test_output_the_backend_will_never_take_is_passed_by(tmp_path):
     """Sent again it was refused again, twice a second, and nothing after it
     ever arrived (GPU-466)."""

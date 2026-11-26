@@ -92,7 +92,9 @@ process group, with or without a backend to hear of it. The agent stops its
 job the same way, and waits for it, when it is itself told to stop
 (``SIGTERM``: ``docker stop``, a machine being given back): the job is in a
 process group of its own, and would otherwise die with the container, its
-last checkpoint unwritten.
+last checkpoint unwritten. A job that ends by itself takes its group with it
+too: whatever its process left running there - a TensorBoard, a profiler, a
+rank - would keep its GPU memory from the next job (GPU-530).
 
 **A bucket without keys (GPU-331).** A job's storage on AWS may come with a
 region and no keys: the node's instance role writes the bucket, and the run is
@@ -2044,6 +2046,12 @@ class Agent:
         running.serve_when_ready()
         code = running.process.poll()
         if code is not None:
+            # What the job left behind in its group goes with it (GPU-530): a
+            # TensorBoard, a profiler or a rank that outlived the main process
+            # kept its CUDA context, and the next job on the GPU ran out of
+            # memory. The job was started in a session of its own
+            # (start_new_session), so its group is never this agent's.
+            running.kill()
             running.close()
             fault = running.fault()
             if fault:

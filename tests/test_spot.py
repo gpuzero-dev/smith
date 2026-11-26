@@ -226,6 +226,7 @@ def _finished_by(stop_reason):
     running.stop_requested_at = time.monotonic() if stop_reason else None
     running.stop_reason = stop_reason or smith.CANCELLED
     running.close = lambda: None
+    running.kill = lambda: None
     running.rendezvous = None
     running.outputs = []
     running.store = "store"
