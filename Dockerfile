@@ -24,7 +24,11 @@ RUN pip install uv
 # `docker compose run --rm --user root <service> chown -R smith:smith /runs`
 # hands it over once.
 RUN useradd --create-home --uid 10001 --user-group smith     && mkdir -p /runs     && chown -R smith:smith /runs
-COPY --chown=smith:smith . /app/smith
+# smith's own files are root's, and only readable to `smith` (GPU-530): owned
+# by the user the jobs run as, a job could rewrite smith.py, cache.py or
+# environment.py, and the agent - or the next job - would run its code.
+COPY . /app/smith
+RUN chmod -R u=rwX,go=rX /app/smith
 WORKDIR /app
 USER smith
 
