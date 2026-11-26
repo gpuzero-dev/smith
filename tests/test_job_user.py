@@ -211,7 +211,9 @@ def test_a_job_runs_as_its_own_user_and_reaches_only_what_is_its_own(runs):
 def test_a_stopped_job_of_its_own_user_goes_with_its_group(runs):
     """A signal to a group of another user's needs root, which the agent is."""
     child = runs.parent / "child.pid"
-    script = runs.parent / "spawn.py"
+    # A folder of its own: the job runs in a copy of it, which cannot hold the runs.
+    (runs.parent / "scripts").mkdir()
+    script = runs.parent / "scripts" / "spawn.py"
     script.write_text(
         "import os, subprocess, sys, time\n"
         "p = subprocess.Popen(['sleep', '300'])\n"
@@ -269,3 +271,131 @@ def test_the_end_of_a_job_spares_its_rendezvous_alone():
     assert rendezvous.poll() is None
     rendezvous.kill()
     rendezvous.wait()
+
+
+#: A build backend in the repository itself, with nothing to fetch: an
+#: editable install is a `.pth` naming the tree's `src`, as setuptools' is.
+BACKEND = r'''
+import base64, hashlib, os, zipfile
+NAME, VERSION = "mypkg", "0.1"
+INFO = "%s-%s.dist-info" % (NAME, VERSION)
+
+
+def get_requires_for_build_editable(config_settings=None):
+    return []
+
+
+get_requires_for_build_wheel = get_requires_for_build_editable
+
+
+def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
+    files = {NAME + ".pth": os.path.abspath("src") + "\n",
+             INFO + "/METADATA": "Metadata-Version: 2.1\nName: %s\nVersion: %s\n" % (NAME, VERSION),
+             INFO + "/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"}
+    wheel = "%s-%s-py3-none-any.whl" % (NAME, VERSION)
+    rows = []
+    with zipfile.ZipFile(os.path.join(wheel_directory, wheel), "w") as archive:
+        for path, text in files.items():
+            data = text.encode()
+            archive.writestr(path, data)
+            digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+            rows.append("%s,sha256=%s,%d" % (path, digest, len(data)))
+        archive.writestr(INFO + "/RECORD", "\n".join(rows + [INFO + "/RECORD,,"]) + "\n")
+    return wheel
+
+
+build_wheel = build_editable
+'''
+
+#: The repository's script: its package, from the editable install, and
+#: whether the job could change it.
+IMPORTS = r'''
+import json, os
+import mypkg
+try:
+    open(mypkg.__file__, "a").close()
+    writable = True
+except OSError:
+    writable = False
+with open(os.path.join(os.environ["RAVEX_STORAGE_PATH"], "probe.json"), "w") as handle:
+    json.dump({"where": mypkg.__file__, "writable": writable}, handle)
+'''
+
+
+@needs_job_user
+def test_an_editable_install_serves_every_job_of_the_commit(runs):
+    """`-e .` linked the environment to the job's copy of the checkout, gone
+    with the job: the next job with the commit could not import the package."""
+    config = smith.Config(backend="http://127.0.0.1:1", name="n", hardware="h", runs=str(runs),
+                          python=sys.executable, code=True, job_user="job", **RUNTIMES)
+    made(runs)
+    checkout = runs / "_code" / "example.com-r" / SHA
+    (checkout / "src" / "mypkg").mkdir(parents=True)
+    (checkout / ".smith-fetched").write_text("")
+    (checkout / "requirements.txt").write_text("-e .\n")
+    (checkout / "pyproject.toml").write_text(
+        '[build-system]\nrequires = []\nbuild-backend = "backend"\nbackend-path = ["."]\n\n'
+        '[project]\nname = "mypkg"\nversion = "0.1"\n')
+    (checkout / "backend.py").write_text(BACKEND)
+    (checkout / "src" / "mypkg" / "__init__.py").write_text("")
+    (checkout / "probe.py").write_text(IMPORTS)
+    seen = []
+    for job_id in (1, 2):
+        job = {"id": job_id, "script": "probe.py", "mode": "fresh", "name": "n", "run_ref": "r-%03d" % job_id,
+               "template": TEMPLATE, "code": {"repo": "https://example.com/r", "commit": SHA}, "params": {}}
+        running = smith.Running(job, config)
+        running.process.wait(timeout=300)
+        with open(running.log_path, encoding="utf-8") as handle:
+            assert running.process.returncode == 0, handle.read()
+        with open(os.path.join(running.store, "probe.json"), encoding="utf-8") as handle:
+            seen.append(json.load(handle))
+        running.close()
+    # The checkout's own package, which outlives every job and none may write.
+    for probe in seen:
+        assert probe["where"] == str(checkout / "src" / "mypkg" / "__init__.py") and probe["writable"] is False
+    assert os.lstat(checkout / "src" / "mypkg" / "__init__.py").st_uid == os.getuid()
+    assert (checkout / ".smith-fetched").exists()
+
+
+#: Reads the file beside it and writes where it runs, as scripts do.
+WORKS = r'''
+import json, os
+with open("data.txt") as handle:
+    data = handle.read()
+with open("out.txt", "w") as handle:
+    handle.write(data)
+with open(os.path.join(os.environ["RAVEX_STORAGE_PATH"], "probe.json"), "w") as handle:
+    json.dump({"cwd": os.getcwd(), "data": data}, handle)
+'''
+
+
+@needs_job_user
+def test_a_script_reads_beside_itself_and_writes_where_it_runs(runs):
+    """A Ravex release's examples and the agent's own scripts are the
+    agent's to write: a script writing ./outputs there failed."""
+    made(runs)
+    release = runs / "_envs" / "_ravex" / TEMPLATE["ravex"]
+    (release / "examples").mkdir(parents=True)
+    (release / ".smith-ready").write_text("")
+    (release / "examples" / "works.py").write_text(WORKS)
+    (release / "examples" / "data.txt").write_text("ravex's")
+    own = runs.parent / "scripts"
+    own.mkdir()
+    (own / "works.py").write_text(WORKS)
+    (own / "data.txt").write_text("the agent's")
+    config = smith.Config(backend="http://127.0.0.1:1", name="n", hardware="h", runs=str(runs),
+                          python=sys.executable, job_user="job", **RUNTIMES,
+                          scripts={"release": "ravex:examples/works.py", "own": str(own / "works.py")})
+    for job_id, (name, data) in enumerate((("release", "ravex's"), ("own", "the agent's")), 1):
+        job = {"id": job_id, "script": name, "mode": "fresh", "name": "n", "run_ref": "r-%03d" % job_id,
+               "template": TEMPLATE, "params": {}}
+        running = smith.Running(job, config)
+        running.process.wait(timeout=120)
+        with open(running.log_path, encoding="utf-8") as handle:
+            assert running.process.returncode == 0, handle.read()
+        with open(os.path.join(running.store, "probe.json"), encoding="utf-8") as handle:
+            seen = json.load(handle)
+        assert seen == {"cwd": os.path.join(running.job_dir, "work"), "data": data}
+        assert not (release / "examples" / "out.txt").exists() and not (own / "out.txt").exists()
+        running.close()
+

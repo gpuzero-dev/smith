@@ -486,13 +486,14 @@ _PARAM = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 #: makes as that user only what runs no code of the job's: the template's
 #: environment, from the versions it names, and the fetch of a commit, which
 #: runs nothing of it. What runs the job's code or writes the job's own
-#: folder - the GPU check, the copy of the checkout the training runs in,
-#: the install of a repository's requirements, whose builds are the
-#: repository's code, every pull and push of a cache - runs as the job's
-#: user. A repository's virtual environment is kept for the next job with
-#: the same commit, so once its install is over every process of the job's
-#: user is killed and the environment made the agent's, which the job can
-#: then read and not write. Only then does the preparer drop to the job's
+#: folder - the GPU check, the copy of the checkout or of the script's
+#: folder the training runs in, the install of a repository's requirements,
+#: whose builds are the repository's code, every pull and push of a cache -
+#: runs as the job's user. A repository's checkout, where its install is
+#: built (an editable one links to it), and its virtual environment are kept
+#: for the next job with the same commit, so once its install is over every
+#: process of the job's user is killed and both are made the agent's, which
+#: the job can then read and not write. Only then does the preparer drop to the job's
 #: user and become the training.
 _PREPARE = r"""
 import base64, json, os, shutil, signal, subprocess, sys, time, urllib.request
@@ -541,6 +542,20 @@ if job_user:
     # read: an agent started with a stricter umask would leave the job no
     # way into its own environment.
     os.umask(0o022)
+
+
+# The job's own copy of a folder, made by the job's user, links kept as links.
+def copy_for_job(source, target, what):
+    run([sys.executable, "-I", "-c", "import shutil, sys; shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True, "
+         "ignore=shutil.ignore_patterns('.smith-*'), dirs_exist_ok=True)", source, target], what, **as_job)
+
+
+# Every path under ``path`` given to the job's user, as the agent: only over
+# what the agent made and no process of the job's user has touched yet.
+def hand_over(path):
+    for folder, dirs, files in os.walk(path):
+        for name in [folder] + [os.path.join(folder, entry) for entry in dirs + files]:
+            os.lchown(name, job_user[0], job_user[1])
 
 
 # Pull or push some of the job's caches; a failure is said and passed. A pull
@@ -688,13 +703,11 @@ if spec["code"]:
         open(fetched, "w").close()
         took("fetched", since)
     # With a user of its own the job runs in a copy of the checkout, its own
-    # to write: the checkout is the agent's, the next job with the same
-    # commit runs it, and a build writes into the tree it builds.
-    own = spec["own_code"] or tree
-    if spec["own_code"]:
-        run([sys.executable, "-I", "-c", "import shutil, sys; shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True, "
-             "ignore=shutil.ignore_patterns('.smith-*'), dirs_exist_ok=True)", tree, own],
-            "copy the checkout for the job", **as_job)
+    # to write, with the repository's files where its paths expect them: the
+    # checkout is the agent's, and the next job with the same commit runs it.
+    own = spec["work"] or tree
+    if spec["work"]:
+        copy_for_job(tree, own, "copy the checkout for the job")
     if os.path.isfile(ready):
         with open(ready, encoding="utf-8") as handle:
             python = json.load(handle)["python"]
@@ -708,11 +721,18 @@ if spec["code"]:
         if wants:
             venv = os.path.join(tree, ".smith-venv-" + flavour)
             if job_user:
-                # Made new, by the job's user, who builds what it installs; a
-                # half-made one from a job that stopped is not built upon.
+                # Built in the checkout, by the job's user, who builds what it
+                # installs (GPU-530). In the checkout and not the job's copy:
+                # an editable install (`-e .`, `pip install -e`) links the
+                # environment to the tree it was built from, and the job's copy
+                # is gone with the job, while the checkout stays for every job
+                # with this commit, sealed with the environment below. Not
+                # fetched until then: a job stopped halfway leaves a tree its
+                # user could write, which the next job fetches again instead.
+                os.remove(fetched)
                 shutil.rmtree(venv, ignore_errors=True)
                 os.makedirs(venv)
-                os.chown(venv, job_user[0], job_user[1])
+                hand_over(tree)
             # On top of the template's Python, whose torch and Ravex it sees.
             run([python, "-m", "venv", "--system-site-packages", venv], "make a virtual environment", **as_job)
             python = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv, "bin", "python")
@@ -723,7 +743,7 @@ if spec["code"]:
             find_links = ["--find-links", spec["wheels"]] if os.path.isdir(spec["wheels"]) and os.listdir(spec["wheels"]) else []
             since = time.monotonic()
             run([shutil.which("uv") or "uv", "pip", "install", "--python", python] + find_links + what,
-                "install the dependencies", cwd=own, **as_job)
+                "install the dependencies", cwd=tree, **as_job)
             took("installed", since)
             if spec["cache_store"]:
                 # What it downloaded is out, what it built stays: the cache is
@@ -733,10 +753,12 @@ if spec["code"]:
                 cache("push", python, ("uv",))
                 wheels_report(python)
             if job_user:
-                # Nothing the install started is left to write it, and then it
-                # is the agent's: the next job with this commit runs it.
+                # Nothing the install started is left to write them, and then
+                # the checkout and its environment are the agent's: the next
+                # job with this commit runs both.
                 run([sys.executable, "-I", "-c", spec["kill_user"]], "stop what the install left running", **as_job)
-                run([sys.executable, "-I", "-c", spec["seal"], venv], "keep the virtual environment from the job")
+                run([sys.executable, "-I", "-c", spec["seal"], tree], "keep the checkout from the job")
+                open(fetched, "w").close()
         with open(ready, "w", encoding="utf-8") as handle:
             json.dump({"python": python}, handle)
     root = os.path.realpath(own)
@@ -759,6 +781,18 @@ else:
         if os.path.commonpath([script, root]) != root or not os.path.isfile(script):
             fail("Ravex %s has no %s" % (spec["template"]["ravex"], spec["script"][len("ravex:"):]))
     root = os.path.dirname(script)
+    if spec["work"]:
+        # A folder of the job's own to work in (GPU-530): the script's is the
+        # agent's - a Ravex release's examples, smith's own scripts - and a
+        # script writes ./outputs or ./checkpoints where it runs. A copy of
+        # it, so what the script reads beside itself is beside it there too.
+        # shortcut: the whole folder is copied each job, so a script beside a
+        # large dataset should read it by an absolute path.
+        work = os.path.realpath(spec["work"])
+        if os.path.commonpath([work, os.path.realpath(root)]) == os.path.realpath(root):
+            fail("%s is in the folder of the script %s, which a job's copy cannot hold" % (spec["work"], script))
+        copy_for_job(root, work, "copy the script's folder for the job")
+        script, root = os.path.join(work, os.path.basename(script)), work
 
 # The agent reads it for the Python of the rendezvous, the cache and the run's shipping.
 with open(spec["ready"], "w", encoding="utf-8") as handle:
@@ -1896,7 +1930,8 @@ class Running:
                 # before it becomes the training as that user (GPU-530).
                 "job_user": list(self.identity) if self.identity else None,
                 "shared_uv": os.path.join(config.runs, "_cache", "uv"),
-                "own_code": os.path.join(self.job_dir, "code") if self.identity and self.code is not None else None,
+                # Where it runs: a copy of its checkout or of its script's folder.
+                "work": os.path.join(self.job_dir, "work") if self.identity else None,
                 "kill_user": _KILL_USER,
                 "seal": _SEAL,
             }

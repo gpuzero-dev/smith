@@ -263,13 +263,16 @@ def main():
     for name, text in ((".smith-fetched", ""), ("requirements.txt", "# nothing\n"), ("probe.py", PROBE)):
         with open(os.path.join(checkout, name), "w") as handle:
             handle.write(text)
-    with open(os.path.join(root, "sleep.py"), "w") as handle:
+    # In a folder of its own: the job runs in a copy of the script's folder,
+    # which must not hold the runs.
+    os.makedirs(os.path.join(root, "scripts"))
+    sleep = os.path.join(root, "scripts", "sleep.py")
+    with open(sleep, "w") as handle:
         handle.write("import subprocess, time\nsubprocess.Popen(['sleep', '600'])\ntime.sleep(600)\n")
-    os.chmod(os.path.join(root, "sleep.py"), 0o644)
 
     config = smith.Config(backend="http://127.0.0.1:1", name="check", hardware="gpu-check", runs=runs,
                           python=sys.executable, code=True, check_gpus=not args.no_gpu_check, gpus=gpus, job_user="job",
-                          scripts={"sleep": os.path.join(root, "sleep.py")}, pythons=[TEMPLATE["python"]],
+                          scripts={"sleep": sleep}, pythons=[TEMPLATE["python"]],
                           torch=TEMPLATE["torch"])
     agent = smith.Agent(config)
     agent.send_logs = lambda: None
