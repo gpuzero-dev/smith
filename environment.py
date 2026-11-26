@@ -49,6 +49,12 @@ _PYTHON = re.compile(r"3\.[0-9]{1,2}")
 RAVEX_SOURCE = "https://github.com/gpuzero-dev/ravex/archive/refs/tags/v%s.tar.gz"
 #: Where the CPU build of PyTorch is published; PyPI's own is CUDA's.
 CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+#: What Ravex samples the machine with, in every job's environment, pinned
+#: (GPU-530): the newest on the day each environment was made was code no one
+#: had chosen, in every job. psutil's abi3 wheels and nvidia-ml-py's pure
+#: Python one serve every Python a template may name. Moved by hand.
+PSUTIL = "psutil==7.2.2"
+NVIDIA_ML_PY = "nvidia-ml-py==13.615.71"
 
 
 def say(message: str) -> None:
@@ -144,7 +150,7 @@ def ensure(
         _run(install + ["torch==" + cpu, "--extra-index-url", CPU_INDEX], "install PyTorch")
     say("installing Ravex %(ravex)s and Moonclip %(moonclip)s" % versions)
     # What Ravex reads the machine with: CPU and RAM, and the GPUs where there are.
-    extra = ["psutil"] + (["nvidia-ml-py"] if gpu else [])
+    extra = [PSUTIL] + ([NVIDIA_ML_PY] if gpu else [])
     _run(install + ["ravex==" + versions["ravex"], "moonclip==" + versions["moonclip"]] + extra,
          "install Ravex %(ravex)s and Moonclip %(moonclip)s" % versions)
     with open(marker, "w", encoding="utf-8") as handle:

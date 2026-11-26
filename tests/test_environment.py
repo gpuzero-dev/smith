@@ -78,7 +78,9 @@ class TestMakingIt:
         assert ran[0] == ["uv", "python", "install", "3.12"]
         # The CPU build by name: plain torch==2.11.0 got PyPI's CUDA one.
         assert "torch==2.11.0+cpu" in ran[2] and environment.CPU_INDEX in ran[2]
-        assert "ravex==0.19.0" in ran[3] and "moonclip==0.4.1" in ran[3] and "nvidia-ml-py" not in ran[3]
+        assert "ravex==0.19.0" in ran[3] and "moonclip==0.4.1" in ran[3] and environment.NVIDIA_ML_PY not in ran[3]
+        # Pinned, as everything else in it is (GPU-530).
+        assert environment.PSUTIL == "psutil==7.2.2" and environment.PSUTIL in ran[3]
         # Made once: the next job with the same template installs nothing.
         assert environment.ensure(TEMPLATE, str(tmp_path)) == python and len(ran) == 4
 
@@ -92,7 +94,7 @@ class TestMakingIt:
         runtime = next(command for command in ran if "--manifest" in command)
         assert runtime[runtime.index("--manifest") + 1] == str(locks / "cp312.json")
         assert runtime[runtime.index("--signed") + 1] == "http://backend/api/cache/global"
-        assert "nvidia-ml-py" in ran[-1]
+        assert environment.NVIDIA_ML_PY in ran[-1]
 
     def test_a_python_the_image_has_no_lock_for_is_said(self, monkeypatch, tmp_path):
         self._faked(monkeypatch, tmp_path)

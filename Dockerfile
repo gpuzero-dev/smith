@@ -13,7 +13,10 @@ FROM python:3.12-bookworm
 
 ENV PYTHONUNBUFFERED=1     PIP_DISABLE_PIP_VERSION_CHECK=1     PIP_NO_CACHE_DIR=1
 
-RUN pip install uv
+# Pinned (GPU-530): uv makes every job's environment, and an unpinned one was
+# whatever PyPI had on the day the image was built. Moved by hand, to a
+# release at least two weeks old; Dependabot reads no pin in a RUN line.
+RUN pip install uv==0.13.8
 
 # smith and every job it starts run as `smith`, not root (GPU-403): a script
 # is code from a repository, and in a container that runs as root a mistake in

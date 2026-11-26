@@ -100,7 +100,10 @@ ENV CUDA_HOME=/usr/local/cuda-12.8     PATH="/usr/local/cuda-12.8/bin:${PATH}"
 # GPU-523): the Python it asks for, the lock's torch, Ravex and Moonclip, and
 # what Ravex samples the machine with (psutil, nvidia-ml-py); and installs a
 # repository's requirements on top.
-RUN pip install uv
+# Pinned (GPU-530): uv makes every job's environment, and an unpinned one was
+# whatever PyPI had on the day the image was built. Moved by hand, to a
+# release at least two weeks old; Dependabot reads no pin in a RUN line.
+RUN pip install uv==0.13.8
 
 # Root's and read-only to anyone else (GPU-530), as in Dockerfile: here the
 # agent and the job both still run as root, so this holds only once the job

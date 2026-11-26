@@ -35,6 +35,7 @@ updates:
       - dependency-name: "*"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
   # No pip entry: smith is standard library only, with no requirements
-  # file or pyproject.toml for Dependabot to read. The libraries the images
-  # install are the ARG pins in the Dockerfiles, which CI.yml compares with
-  # PyPI on every run.
+  # file or pyproject.toml for Dependabot to read. What the images and the
+  # jobs' environments install of their own - uv in the Dockerfiles, psutil
+  # and nvidia-ml-py in environment.py - is pinned there and moved by hand
+  # (GPU-530): Dependabot reads neither a RUN line nor a Python constant.
