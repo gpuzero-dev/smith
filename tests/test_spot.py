@@ -139,6 +139,9 @@ def _running():
         last_report=time.monotonic(),
         stop_reason=None,
         push_while_running=lambda _config: None,
+        serve_when_ready=lambda: None,
+        fault=lambda: None,
+        python=lambda: "python",
     )
 
     def stop(reason="cancelled by the backend"):

@@ -25,22 +25,32 @@ python smith.py --config smith.toml
 ```
 
 In a container on CPU (`Dockerfile`, config `smith.docker.toml`), or on a
-provider's GPU node (`Dockerfile.gpu`, config `smith.gpu.toml`). Both images take
-Moonclip and Ravex from one of two places:
+provider's GPU node (`Dockerfile.gpu`, config `smith.gpu.toml`):
 
 ```bash
-# From PyPI, at MOONCLIP_VERSION / RAVEX_VERSION: this repository alone.
 docker build -t smith .
-
-# Built from checkouts, for a Ravex or a Moonclip ahead of PyPI.
-docker build -t smith --build-arg LIBS=source \
-  --build-context moonclip=../moonclip --build-context ravex=../ravex .
+docker build -f Dockerfile.gpu -t smith-gpu .
 ```
+
+**A job brings what it trains with** (GPU-523). Neither image carries torch,
+Ravex or Moonclip. A job carries a template, the exact versions
+`{"python": "3.12", "torch": "2.11.0+cu128", "ravex": "0.19.0", "moonclip": "0.4.1"}`,
+and before its script `environment.py` makes that environment on the machine,
+once: a Python of that version installed by uv into a folder of its own
+(`<runs>/_envs/<template>/`), torch into it (from the GPU image's lock for that
+Python, `runtime/cp312.json` and the others, or torch's CPU build from its
+index), then Ravex, Moonclip, psutil and, on a GPU, nvidia-ml-py. The next job
+with the same template finds it made. A repository's requirements are a
+virtual environment on top of it, with `--system-site-packages`. A machine
+claims only what it can make: it sends the backend `pythons` (the ones it has
+a torch for: the GPU image's locks, or `pythons` in the file) and `torch`, and
+a job without a template, or with one it cannot make, fails saying so. A
+script of `[scripts]` written `ravex:<path>` is a file of the job's Ravex
+release, its examples and benches, fetched once per release from its tag.
 
 The GPU image is published by pushing to the `deploy` branch
 (`git push origin main:deploy`): `.github/workflows/CD.yml`, its `gpu` job,
-once `CI.yml` has passed on that commit, builds it from
-PyPI and pushes it as `ghcr.io/<owner>/smith-gpu:<commit>`, smith's short
+once `CI.yml` has passed on that commit, builds it and pushes it as `ghcr.io/<owner>/smith-gpu:<commit>`, smith's short
 commit, and as `:latest`, then checks both tags are in the registry and that
 no layer is over 250 MB. Last, it tells the backend which bytes it pushed:
 `POST /api/agent-image` with `Authorization: Bearer <SMITH_IMAGE_TOKEN>`
@@ -55,9 +65,9 @@ run.
 **The GPU image does not carry torch.** torch with its CUDA libraries is
 about 7 GB, and a host's docker that drops a layer pulls it again from its
 first byte: on slow hosts the image never arrived. So the image carries only
-the lock, `runtime.json` (each wheel's name, address and sha256, resolved
-from `runtime.in` when it is built), and `runtime.py` fetches the wheels when
-the node starts, before the first heartbeat: in pieces, sixteen at once, each
+the locks, one per Python (`runtime/cp311.json`, `cp312.json`, `cp313.json`:
+each wheel's name, address and sha256, resolved from `runtime.in` when it is
+built), and `runtime.py` fetches the wheels when a job's environment is made: in pieces, sixteen at once, each
 retried on its own, each file checked against its hash, then installed with
 uv. Each file comes from the first source that has it: the backend's cache
 when the node uses it (`SMITH_CACHE=backend`), at `runtime/<wheel file name>`
@@ -71,7 +81,7 @@ file name; else the index the wheel was resolved from.
 published an image, then every hour (or by hand), for the image nodes start
 from, which the backend names by digest in its answer to
 `POST /api/cache-builds/pending` (`{"queued": <n>, "image": "sha256:..."}`),
-never for a tag: it takes `runtime.json` out of that image and runs `runtime.py fill`,
+never for a tag: it takes the locks out of that image and runs `runtime.py fill` on each,
 which fetches each wheel the cache lacks from its index, checks its sha256
 and uploads it, one at a time. Like the wheel builder, the same workflow's
 `wheels` job, it holds no bucket key, only the secrets `SMITH_BACKEND` and
@@ -167,18 +177,19 @@ stay billed.
 `SMITH_IMAGE`, which the GPU image sets to its own tag, is written as the first
 line of every job's output: `[smith] image ghcr.io/.../smith-gpu:<commit>`.
 
-**The GPU check.** On hardware named `gpu...`, smith first asks the
-interpreter that runs the training whether its GPUs work: torch sees CUDA, as
-many GPUs as `SMITH_GPUS`, and a small sum on each. A machine whose container
-cannot reach its GPU would otherwise train on the CPU, slowly, while it is paid
-for as a GPU. If the check fails smith takes no job, and says what is wrong as
-`fault` in every heartbeat, for the backend to give the machine back.
+**The GPU check.** On hardware named `gpu...`, the first job's environment,
+once made, is asked whether its GPUs work: torch sees CUDA, as many GPUs as
+`SMITH_GPUS`, and a small sum on each (the image has no torch of its own to
+ask before, GPU-523). A machine whose container cannot reach its GPU would
+otherwise train on the CPU, slowly, while it is paid for as a GPU. If the
+check fails that job fails saying so, smith takes no other, and says what is
+wrong as `fault` in every heartbeat, for the backend to give the machine back.
 `check_gpus = false` (or `SMITH_CHECK_GPUS=0`) turns it off; `true` turns it
 on for hardware named otherwise.
 
-**The runtime.** With `runtime = "<manifest>"` in its configuration, as the
-GPU image has, smith installs that manifest's wheels before anything else,
-the GPU check included (see above, and `runtime.py`). With the backend's
+**The runtime.** With `locks = "<folder>"` in its configuration, as the GPU
+image has, a job's environment gets torch from the lock of its Python there,
+before the GPU check (see above, and `runtime.py`). With the backend's
 cache, the node first asks `POST /api/cache/global` with its token and
 `{"op": "get", "path": "runtime/<wheel file name>"}` for each wheel, and
 expects `{"url": "<presigned GET that takes Range requests>"}`; a URL that

@@ -12,6 +12,11 @@ backend = "http://127.0.0.1:8600"
 hardware = "local-cpu"
 # One store per run is made here, plus _logs/ with each job's output.
 runs = "runs"
+# What a job's template may ask for here (GPU-523): each job's environment
+# is made with uv - that Python, PyTorch's CPU build of this version, the
+# job's Ravex and Moonclip - and kept for the next job with the same one.
+pythons = ["3.11", "3.12", "3.13"]
+torch = "2.11.0+cpu"
 # The interpreter for the scripts. Default: the one running smith, which is
 # why it is started from the training environment's venv.
 # python = "../ravex/.venv/bin/python"
@@ -22,4 +27,4 @@ runs = "runs"
 # so the backend offers a run from scratch instead of save or fork.
 # `params`: what a job starts from, filled into the Launch page when the
 # script is picked. Only flags the script takes: the form sends them as-is.
-spiral = { path = "../ravex/examples/spiral.py", model = ["width"], params = { lr = 5e-3, steps = 3000 } }
+spiral = { path = "ravex:examples/spiral.py", model = ["width"], params = { lr = 5e-3, steps = 3000 } }

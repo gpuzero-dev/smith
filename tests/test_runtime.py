@@ -351,18 +351,6 @@ def test_the_token_comes_from_the_environment_and_never_the_command_line(serve, 
     runtime.main(arguments)
     assert signer.signed == ["runtime/" + entry["name"]]
 
-    # And smith puts it there: in the environment of the command it runs,
-    # never in its arguments; without the backend's cache, no --signed at all.
-    config = types.SimpleNamespace(python="python", runtime="/app/runtime.json", backend="http://backend",
-                                   token="the-token", cache_service=True)
-    command, env = smith.Agent.runtime_command(types.SimpleNamespace(config=config), "runtime.py")
-    assert command[command.index("--signed") + 1] == "http://backend/api/cache/global"
-    assert not any("the-token" in part for part in command)
-    assert env["SMITH_CACHE_TOKEN"] == "the-token"
-    config.cache_service = False
-    command, env = smith.Agent.runtime_command(types.SimpleNamespace(config=config), "runtime.py")
-    assert "--signed" not in command
-
 
 # ─── filling the cache ────────────────────────────────────────────────
 

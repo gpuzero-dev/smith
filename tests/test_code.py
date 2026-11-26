@@ -13,6 +13,7 @@ import sys
 import pytest
 
 import smith
+from made import RUNTIMES, TEMPLATE, made
 
 COMMIT = "a" * 40
 REPO = "https://github.com/someone/model"
@@ -20,12 +21,12 @@ REPO = "https://github.com/someone/model"
 
 def _config(tmp_path):
     return smith.Config(backend="http://127.0.0.1:1", name="n", hardware="h", runs=str(tmp_path / "runs"),
-                        python=sys.executable, scripts={}, code=True)
+                        python=sys.executable, scripts={}, code=True, **RUNTIMES)
 
 
 def _job(script):
     return {"id": 1, "script": script, "mode": "fresh", "name": "n", "run_ref": "r-001", "params": {"lr": 0.1},
-            "code": {"repo": REPO, "commit": COMMIT}}
+            "code": {"repo": REPO, "commit": COMMIT}, "template": TEMPLATE}
 
 
 def _fetched(tmp_path, files):
@@ -34,7 +35,9 @@ def _fetched(tmp_path, files):
     for name, text in files.items():
         (tree / name).parent.mkdir(parents=True, exist_ok=True)
         (tree / name).write_text(text)
-    (tree / ".smith-ready").write_text(json.dumps({"python": sys.executable}))
+    flavour = made(tmp_path / "runs")
+    (tree / ".smith-fetched").write_text("")
+    (tree / (".smith-ready-" + flavour)).write_text(json.dumps({"python": sys.executable}))
     return tree
 
 

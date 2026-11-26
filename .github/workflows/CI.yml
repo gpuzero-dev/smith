@@ -130,10 +130,10 @@ jobs:
           context: .
           load: true
           tags: smith:ci
-      - name: The libraries import, and the examples are where the config says
+      # No libraries in the image (GPU-523): what makes a job's environment is.
+      - name: The image can make a job's environment
         run: |
-          docker run --rm smith:ci python -c "import moonclip, ravex; print(ravex.__version__)"
-          docker run --rm smith:ci test -f /app/examples/spiral.py
+          docker run --rm smith:ci sh -c "uv --version && test -f /app/smith/environment.py"
       - name: Stop the whole run
         if: failure()
         env:

@@ -1,71 +1,17 @@
 # syntax=docker/dockerfile:1
 #
-# smith for a provider's GPU node: the same agent as Dockerfile, with the
-# lock of CUDA torch (runtime.json) that it fetches and installs when the node
-# starts, and the NVIDIA management library, so a job asking for a GPU gets
-# one and Ravex can sample it.
+# smith for a provider's GPU node: the same agent as Dockerfile, with a lock
+# of CUDA torch per Python (runtime/cp312.json and the others) that it fetches
+# and installs into a job's environment, and nvcc for TileLang's kernels.
 #
 #   docker build -f Dockerfile.gpu -t smith-gpu .
 #
-# Moonclip and Ravex from PyPI by default, or compiled from checkouts with
-# LIBS=source and the two contexts, as in Dockerfile:
+# No Ravex and no Moonclip in it (GPU-523): a job carries its template - its
+# Python, the torch of the lock, and the Ravex and Moonclip it trains with -
+# and smith makes that environment on the node (environment.py), so a release
+# of either needs no new image. Run on a node with the NVIDIA container toolkit:
 #
-#   docker build -f Dockerfile.gpu -t smith-gpu --build-arg LIBS=source \
-#     --build-context moonclip=../moonclip --build-context ravex=../ravex .
-#
-# and run on a node with the NVIDIA container toolkit:
-#
-#   docker run --gpus all --init \
-#     -e SMITH_BACKEND=https://... -e SMITH_TOKEN=... \
-#     -e SMITH_HARDWARE=gpu-a100 \
-#     -e SMITH_STORAGE_BUCKET=... -e SMITH_STORAGE_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
-#     -e MOONCLIP_S3_ACCESS_KEY=... -e MOONCLIP_S3_SECRET_KEY=... \
-#     smith-gpu
-#
-# Either way the libraries arrive as wheels made in a stage of their own, so
-# the compiler a source build needs stays behind: a rented node pulls this
-# image before it can do anything, and a Rust toolchain is a gigabyte it would
-# pull for nothing.
-ARG LIBS=pypi
-
-# ─── wheels: from PyPI ─────────────────────────────────────────────────
-FROM python:3.12-bookworm AS wheels-pypi
-ARG MOONCLIP_VERSION=0.4.1
-ARG RAVEX_VERSION=0.19.0
-RUN pip download --no-deps --only-binary=:all: -d /wheels \
-      "moonclip==${MOONCLIP_VERSION}" "ravex==${RAVEX_VERSION}"
-# The scripts smith.gpu.toml offers are Ravex's examples and GPU benches, which
-# the wheel does not carry: taken from the release's tag, so they match the
-# library. A bench newer than the release is not there, and a job naming it
-# fails at start saying so.
-RUN curl -fsSL "https://github.com/gpuzero-dev/ravex/archive/refs/tags/v${RAVEX_VERSION}.tar.gz" \
-      | tar -xz -C /tmp \
-    && mv "/tmp/ravex-${RAVEX_VERSION}/examples" /examples \
-    && mv "/tmp/ravex-${RAVEX_VERSION}/bench" /bench
-
-# ─── wheels: from checkouts ────────────────────────────────────────────
-FROM python:3.12-bookworm AS wheels-source
-
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PATH="/root/.cargo/bin:${PATH}"
-
-# The version Moonclip pins in its rust-toolchain.toml (see Dockerfile).
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy \
-    && pip install maturin
-
-COPY --from=moonclip . /src/moonclip
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/src/moonclip/target \
-    maturin build --release --locked -m /src/moonclip/Cargo.toml --out /wheels
-
-# Ravex is pure Python since GPU-267: a plain wheel, no cargo.
-COPY --from=ravex . /src/ravex
-RUN pip wheel --no-deps --wheel-dir /wheels /src/ravex \
-    && cp -r /src/ravex/examples /examples && cp -r /src/ravex/bench /bench
-
-FROM wheels-${LIBS} AS wheels
+#   docker run --gpus all --init #     -e SMITH_BACKEND=https://... -e SMITH_TOKEN=... #     -e SMITH_HARDWARE=gpu-a100 #     -e SMITH_STORAGE_BUCKET=... -e SMITH_STORAGE_ENDPOINT=https://<account>.r2.cloudflarestorage.com #     -e MOONCLIP_S3_ACCESS_KEY=... -e MOONCLIP_S3_SECRET_KEY=... #     smith-gpu
 
 # ─── runtime: torch and its CUDA libraries, never in the image ─────────
 # **Fetched by the node, not pulled with the image** (runtime.py). torch with
@@ -81,33 +27,36 @@ FROM wheels-${LIBS} AS wheels
 # .github/workflows/CD.yml, from this lock, as soon as the image is
 # published and again every hour.
 #
-# Resolved here from runtime.in, with both indexes: torch is pinned with its
-# local version, which only the cu128 index has, so PyPI cannot offer a newer
-# one; everything else is pinned by torch or free to be the newest of either.
-# Then fetched and installed once in this stage, which the image does not
-# keep, so a lock that cannot be installed fails the build and not a node.
+# Resolved from runtime.in once per Python a job may ask for (GPU-523), each
+# in a stage of that Python (runtime-lock.sh), with both indexes: torch is
+# pinned with its local version, which only the cu128 index has, so PyPI
+# cannot offer a newer one; everything else is pinned by torch or free to be
+# the newest of either. Then fetched and installed once in that stage, which
+# the image does not keep, so a lock that cannot be installed fails the build
+# and not a node.
 # The `bundle` target below is these wheels alone, for whoever fills a cache
 # or a mirror with them.
-FROM python:3.12-slim-bookworm AS runtime
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
-COPY runtime.in runtime.py /lock/
-# pip reads a wheel's dependencies from the wheel itself where the index
-# offers no metadata of its own, as the cu128 one does not: resolving is
-# downloading it all once, so its cache is kept between builds.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    PIP_NO_CACHE_DIR= pip install --dry-run --ignore-installed --quiet --report /lock/report.json \
-      --index-url ${TORCH_INDEX} --extra-index-url https://pypi.org/simple -r /lock/runtime.in \
-    && python /lock/runtime.py lock --report /lock/report.json --out /runtime/runtime.json \
-    && python /lock/runtime.py fetch --manifest /runtime/runtime.json --dir /runtime/wheels
-RUN pip install --no-deps --no-index /runtime/wheels/*.whl \
-    && pip check \
-    && python -c "import torch; assert torch.__version__ == '2.11.0+cu128', torch.__version__"
+FROM python:3.11-slim-bookworm AS runtime-311
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 TORCH_INDEX=https://download.pytorch.org/whl/cu128
+COPY runtime.in runtime.py runtime-lock.sh /lock/
+RUN --mount=type=cache,target=/root/.cache/pip sh /lock/runtime-lock.sh
+
+FROM python:3.12-slim-bookworm AS runtime-312
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 TORCH_INDEX=https://download.pytorch.org/whl/cu128
+COPY runtime.in runtime.py runtime-lock.sh /lock/
+RUN --mount=type=cache,target=/root/.cache/pip sh /lock/runtime-lock.sh
+
+FROM python:3.13-slim-bookworm AS runtime-313
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 TORCH_INDEX=https://download.pytorch.org/whl/cu128
+COPY runtime.in runtime.py runtime-lock.sh /lock/
+RUN --mount=type=cache,target=/root/.cache/pip sh /lock/runtime-lock.sh
 
 # docker build --target bundle --output type=local,dest=<dir>: the wheels,
 # named as a cache (under runtime/) or a mirror serves them.
 FROM scratch AS bundle
-COPY --from=runtime /runtime/wheels/ /
+COPY --from=runtime-311 /runtime/wheels/ /
+COPY --from=runtime-312 /runtime/wheels/ /
+COPY --from=runtime-313 /runtime/wheels/ /
 
 # ─── run: what the node pulls ──────────────────────────────────────────
 # Slim Python rather than a CUDA base image: torch's CUDA wheels carry their
@@ -147,21 +96,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends cuda-cudart-dev
     && rm -rf /var/lib/apt/lists/*
 ENV CUDA_HOME=/usr/local/cuda-12.8     PATH="/usr/local/cuda-12.8/bin:${PATH}"
 
-# psutil for CPU and RAM, nvidia-ml-py (imported as pynvml) for the GPUs:
-# Ravex samples each only if it is importable, and says nothing otherwise.
-# uv installs what a repository's requirements ask for, in its venv, much
-# faster than pip; without it smith falls back to pip.
-RUN pip install psutil nvidia-ml-py uv
+# uv makes each job's environment from its template (environment.py,
+# GPU-523): the Python it asks for, the lock's torch, Ravex and Moonclip, and
+# what Ravex samples the machine with (psutil, nvidia-ml-py); and installs a
+# repository's requirements on top.
+RUN pip install uv
 
-COPY --from=wheels /wheels /wheels
-RUN pip install /wheels/*.whl && rm -rf /wheels
-
-# The scripts smith.gpu.toml offers. Sources, if any, stayed in their stage.
-COPY --from=wheels /examples /app/examples
-COPY --from=wheels /bench /app/bench
 COPY . /app/smith
-# The lock of what the node fetches at start (runtime.py), not the wheels.
-COPY --from=runtime /runtime/runtime.json /app/runtime.json
+# The locks of what a job's environment fetches (runtime.py), not the wheels.
+COPY --from=runtime-311 /runtime/cp311.json /app/runtime/cp311.json
+COPY --from=runtime-312 /runtime/cp312.json /app/runtime/cp312.json
+COPY --from=runtime-313 /runtime/cp313.json /app/runtime/cp313.json
 WORKDIR /app
 
 # The tag this image is published as, which smith writes at the top of every

@@ -319,16 +319,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # Only the lock out of the image: about 300 MB pulled, never started.
+      # Only the locks out of the image, one per Python (GPU-523): about 300 MB
+      # pulled, never started.
       - name: Lock
         if: steps.image.outputs.image != ''
         env:
           DIGEST: ${{ steps.image.outputs.image }}
         run: |
           id=$(docker create "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/smith-gpu@$DIGEST")
-          docker cp "$id:/app/runtime.json" runtime.json
+          docker cp "$id:/app/runtime" runtime-locks
           docker rm "$id" > /dev/null
-          python3 -c 'import json; print(len(json.load(open("runtime.json"))["files"]), "wheels in the lock")'
+          for lock in runtime-locks/*.json; do
+            python3 -c 'import json, sys; print(sys.argv[1], len(json.load(open(sys.argv[1]))["files"]), "wheels")' "$lock"
+          done
       # One wheel on disk at a time (runtime.py), so the runner's free disk
       # holds the largest, about a gigabyte, and needs no room made. The token
       # reaches runtime.py through its environment, never its arguments.
@@ -338,8 +341,10 @@ jobs:
           SMITH_BACKEND: ${{ secrets.SMITH_BACKEND }}
           SMITH_BUILDER_TOKEN: ${{ secrets.SMITH_BUILDER_TOKEN }}
         run: |
-          python3 runtime.py fill --manifest runtime.json \
-            --builder "${SMITH_BACKEND%/}/api/cache-runtime/sign" 2>&1 | tee fill.log
+          for lock in runtime-locks/*.json; do
+            python3 runtime.py fill --manifest "$lock" \
+              --builder "${SMITH_BACKEND%/}/api/cache-runtime/sign" 2>&1 | tee -a fill.log
+          done
       - name: Summary
         if: always() && steps.image.outputs.image != ''
         env:
@@ -445,13 +450,21 @@ jobs:
           DIGEST: ${{ steps.pending.outputs.image }}
         run: |
           mkdir -p "$RUNNER_TEMP/out"
-          # torch first: the image carries only its lock (runtime.py), and a
-          # wheel is built against the torch the nodes install from it.
+          # The key's Python and torch first: the image carries only uv and the
+          # locks (GPU-523), and a wheel is built against the Python and torch
+          # the nodes' environments have - the key's own, `cp312` and the like.
           docker run --rm \
             -v "$PWD/builder.py:/builder/builder.py:ro" -v "$PWD/cache.py:/builder/cache.py:ro" \
             -v "$RUNNER_TEMP/build.json:/builder/build.json:ro" -v "$RUNNER_TEMP/out:/out" \
             "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/smith-gpu@$DIGEST" \
-            sh -c "python /app/smith/runtime.py install --manifest /app/runtime.json && python /builder/builder.py --build /builder/build.json --out /out"
+            sh -c 'set -e
+              tag=$(python -c "import json; print(json.load(open(\"/builder/build.json\"))[\"key\"][\"python\"])")
+              version=3.${tag#cp3}
+              export UV_PYTHON_INSTALL_DIR=/opt/python
+              uv python install "$version"
+              python=$(uv python find --managed-python "$version")
+              python /app/smith/runtime.py install --manifest "/app/runtime/$tag.json" --python "$python"
+              "$python" /builder/builder.py --build /builder/build.json --out /out'
       # Whatever the build did, a claimed build is told to the backend: its
       # wheel pushed, or why there is none.
       - name: Finish

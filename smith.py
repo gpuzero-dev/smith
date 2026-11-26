@@ -34,9 +34,9 @@ of the agent's own; nothing of the backend's lives in the repository
 (GPU-497). Before it starts, the job's
 process fetches that commit alone into ``runs/_code/<repository>/<commit>``,
 makes a virtual environment beside it when the repository has a
-``requirements.txt`` or a ``pyproject.toml`` (on top of this Python's own
-packages, so torch and Ravex are there already; with ``uv`` when it is
-installed) and then runs the script with the job's parameters as flags. A
+``requirements.txt`` or a ``pyproject.toml`` (on top of the job's template
+environment, so torch and Ravex are there already; with ``uv``) and then runs
+the script with the job's parameters as flags. A
 commit already fetched is used again. Every step is in the job's output, with
 how long it took (GPU-219). It
 is still never a command: a repository, a commit and a file of it, each
@@ -266,6 +266,9 @@ IMAGE = os.environ.get("SMITH_IMAGE", "").strip()
 #: wheels its environment is built from. By path, because the job's
 #: interpreter cannot import it - it is not installed anywhere.
 CACHE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.py")
+#: What makes a job's environment from its template (GPU-523), run as a
+#: script with this agent's own Python.
+ENVIRONMENT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "environment.py")
 
 #: The compiled directories a job keeps, by name in the cache: the variable
 #: that points the tool at it, and the library whose version is part of what
@@ -420,11 +423,6 @@ print("%d GPU(s): %s" % (want, ", ".join(torch.cuda.get_device_name(i) for i in 
 #: tens of seconds, never minutes.
 GPU_CHECK_SECONDS = 180.0
 
-#: How long fetching and installing the runtime may take (``runtime.py``):
-#: about 3.5 GB of wheels, a minute at 500 Mb/s and ten at 50. Past that the
-#: machine is too slow to be worth its price, and says so.
-RUNTIME_SECONDS = 15 * 60.0
-
 
 #: What a job's code may be: a repository over HTTPS, a commit as a full SHA,
 #: and a Python file of it. Checked before anything runs, so a value cannot
@@ -437,11 +435,15 @@ _RELATIVE = re.compile(r"^(?!/)(?!.*\.\.)[A-Za-z0-9_./-]{1,200}\.py$")
 #: final newline.
 _PARAM = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 
-#: A job with ``code`` runs this first, as its own process: fetch the commit,
-#: make its environment, check the script is a file of it, then become the
-#: training. In the job's process and not in this agent, so a clone and an
-#: install of several minutes neither stop the heartbeats nor escape the
-#: job's output, and a stop reaches them like it reaches the training.
+#: Every job runs this first, as its own process (GPU-523): make the
+#: environment its template asks for (``environment.py``), check the GPUs
+#: once per machine, then for a repository's job fetch the commit and install
+#: its requirements on top, and become the training. In the job's process
+#: and not in this agent, so installs of several minutes neither stop the
+#: heartbeats nor escape the job's output, and a stop reaches them like it
+#: reaches the training. What it made is written to the job's ``ready`` file,
+#: which the agent reads for the Python of the rendezvous, of ``ravex ship``
+#: and of the kernels' cache.
 _PREPARE = r"""
 import base64, json, os, shutil, signal, subprocess, sys, time, urllib.request
 
@@ -503,11 +505,11 @@ def cache(action, python, names):
 # cache's global part, which only that builder writes: no --with, since what a
 # wheel was built against is the interpreter, torch and the GPUs, not the uv
 # that installs it.
-def wheels_pull():
+def wheels_pull(python):
     if not spec["wheels_store"]:
         return
     since = time.monotonic()
-    done = subprocess.run([sys.executable, spec["cache_script"], "pull", "--name", "wheels",
+    done = subprocess.run([python, spec["cache_script"], "pull", "--name", "wheels",
                            "--dir", spec["wheels"], "--store", spec["wheels_store"]],
                           stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env))
     if done.returncode != 0:
@@ -521,7 +523,7 @@ def wheels_pull():
 # compile from PyPI's source for the next machine like this one. Only names:
 # nothing this machine made goes where every machine reads. The wheels uv
 # built are the ones `uv cache prune --ci` left in its sdists bucket.
-def wheels_report():
+def wheels_report(python):
     if not spec["wheels_report"]:
         return
     have = set(os.listdir(spec["wheels"])) if os.path.isdir(spec["wheels"]) else set()
@@ -536,7 +538,7 @@ def wheels_report():
     if not built:
         return
     try:
-        key = json.loads(subprocess.run([sys.executable, spec["cache_script"], "key", "--name", "wheels"],
+        key = json.loads(subprocess.run([python, spec["cache_script"], "key", "--name", "wheels"],
                                         stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True).stdout)
         body = json.dumps({"key": key, "wheels": [{"name": n, "version": v} for n, v in sorted(built)]}).encode()
         request = urllib.request.Request(spec["wheels_report"], data=body, method="POST", headers={
@@ -551,74 +553,133 @@ def wheels_report():
         say("the compiled wheels were not reported: %s" % exc)
 
 
-tree = spec["tree"]
-ready = os.path.join(tree, ".smith-ready")
-short = spec["commit"][:12]
-if os.path.isfile(ready):
-    with open(ready, encoding="utf-8") as handle:
-        python = json.load(handle)["python"]
-    say("%s at %s, fetched before" % (spec["repo"], short))
-else:
-    # From nothing each time: a fetch cut short leaves no marker.
-    shutil.rmtree(tree, ignore_errors=True)
-    os.makedirs(tree)
-    say("fetching %s at %s" % (spec["repo"], short))
+# The template's environment: made once per machine, said in the output.
+made = os.path.join(spec["envs"], ".made-%d.json" % os.getpid())
+command = [sys.executable, spec["environment_script"], "ensure", "--template", json.dumps(spec["template"]),
+           "--root", spec["envs"], "--out", made]
+if spec["locks"]:
+    command += ["--locks", spec["locks"]]
+if spec["signed"]:
+    command += ["--signed", spec["signed"]]
+if spec["gpu"]:
+    command += ["--gpu"]
+if subprocess.run(command, stdin=subprocess.DEVNULL, env=dict(os.environ, **cache_env)).returncode != 0:
+    fail("could not make the job's libraries")
+with open(made, encoding="utf-8") as handle:
+    made_here = json.load(handle)
+python, flavour = made_here["python"], made_here["flavour"]
+os.remove(made)
+took("libraries ready", began)
+
+# The GPUs, once per machine, with the torch the job will use (GPU-188): a
+# machine whose container cannot reach them would train on the CPU, slowly,
+# and be paid for as a GPU. Said in the fault file, which the agent reports.
+if spec["gpu_check"] and not os.path.isfile(spec["gpu_checked"]):
     since = time.monotonic()
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
-    if token:
-        # In git's environment, where other users of the machine cannot read
-        # it, rather than in the address or on the command line.
-        basic = base64.b64encode(("x-access-token:" + token).encode()).decode()
-        env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraHeader",
-                   GIT_CONFIG_VALUE_0="Authorization: Basic " + basic)
-    run(["git", "init", "-q", tree], "make a repository in " + tree, env=env)
-    run(["git", "-C", tree, "fetch", "-q", "--depth", "1", spec["repo"], spec["commit"]],
-        "fetch commit %s; is the repository right, and is a private one given its token?" % short, env=env)
-    run(["git", "-C", tree, "checkout", "-q", "--detach", "FETCH_HEAD"], "check out " + short, env=env)
-    took("fetched", since)
-    python = sys.executable
-    # Before the install, with this interpreter: the wheels are built against
-    # what it has, which is what the new environment starts from.
-    cache("pull", python, ("uv",))
-    wheels_pull()
-    wants = "requirements.txt" if os.path.isfile(os.path.join(tree, "requirements.txt")) else (
-        "pyproject.toml" if os.path.isfile(os.path.join(tree, "pyproject.toml")) else None)
-    if wants:
-        venv = os.path.join(tree, ".smith-venv")
-        run([sys.executable, "-m", "venv", "--system-site-packages", venv], "make a virtual environment")
-        python = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv, "bin", "python")
-        what = ["-r", "requirements.txt"] if wants == "requirements.txt" else ["."]
-        say("installing what %s asks for" % wants)
-        # A wheel there wins over the sdist of the same version on PyPI, so
-        # what the builder compiled is installed instead of compiled again.
-        find_links = ["--find-links", spec["wheels"]] if os.path.isdir(spec["wheels"]) and os.listdir(spec["wheels"]) else []
+    try:
+        done = subprocess.run([python, "-c", spec["gpu_check_script"], str(spec["gpus"])], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=spec["gpu_check_seconds"])
+        said = [line for line in (done.stdout or "").splitlines() if line.strip()] or [
+            line for line in (done.stderr or "").splitlines() if line.strip()]
+        last, ok = (said[-1] if said else "no answer"), done.returncode == 0
+    except subprocess.TimeoutExpired:
+        last, ok = "it did not finish in %d seconds" % spec["gpu_check_seconds"], False
+    if not ok:
+        with open(spec["fault_file"], "w", encoding="utf-8") as handle:
+            handle.write("the GPU check failed: %s" % last)
+        say("the GPU check failed: %s" % last)
+        sys.exit(3)
+    open(spec["gpu_checked"], "w").close()
+    took("GPUs checked: %s" % last, since)
+
+if spec["code"]:
+    code = spec["code"]
+    tree = code["tree"]
+    # One environment per template on top of one checkout per commit.
+    ready = os.path.join(tree, ".smith-ready-" + flavour)
+    short = code["commit"][:12]
+    fetched = os.path.join(tree, ".smith-fetched")
+    if os.path.isfile(fetched):
+        say("%s at %s, fetched before" % (code["repo"], short))
+    else:
+        # From nothing each time: a fetch cut short leaves no marker.
+        shutil.rmtree(tree, ignore_errors=True)
+        os.makedirs(tree)
+        say("fetching %s at %s" % (code["repo"], short))
         since = time.monotonic()
-        uv = shutil.which("uv")
-        if uv:
-            run([uv, "pip", "install", "--python", python] + find_links + what, "install the dependencies", cwd=tree)
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        if token:
+            # In git's environment, where other users of the machine cannot read
+            # it, rather than in the address or on the command line.
+            basic = base64.b64encode(("x-access-token:" + token).encode()).decode()
+            env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraHeader",
+                       GIT_CONFIG_VALUE_0="Authorization: Basic " + basic)
+        run(["git", "init", "-q", tree], "make a repository in " + tree, env=env)
+        run(["git", "-C", tree, "fetch", "-q", "--depth", "1", code["repo"], code["commit"]],
+            "fetch commit %s; is the repository right, and is a private one given its token?" % short, env=env)
+        run(["git", "-C", tree, "checkout", "-q", "--detach", "FETCH_HEAD"], "check out " + short, env=env)
+        open(fetched, "w").close()
+        took("fetched", since)
+    if os.path.isfile(ready):
+        with open(ready, encoding="utf-8") as handle:
+            python = json.load(handle)["python"]
+    else:
+        # Before the install, with this interpreter: the wheels are built against
+        # what it has, which is what the new environment starts from.
+        cache("pull", python, ("uv",))
+        wheels_pull(python)
+        wants = "requirements.txt" if os.path.isfile(os.path.join(tree, "requirements.txt")) else (
+            "pyproject.toml" if os.path.isfile(os.path.join(tree, "pyproject.toml")) else None)
+        if wants:
+            venv = os.path.join(tree, ".smith-venv-" + flavour)
+            # On top of the template's Python, whose torch and Ravex it sees.
+            run([python, "-m", "venv", "--system-site-packages", venv], "make a virtual environment")
+            python = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv, "bin", "python")
+            what = ["-r", "requirements.txt"] if wants == "requirements.txt" else ["."]
+            say("installing what %s asks for" % wants)
+            # A wheel there wins over the sdist of the same version on PyPI, so
+            # what the builder compiled is installed instead of compiled again.
+            find_links = ["--find-links", spec["wheels"]] if os.path.isdir(spec["wheels"]) and os.listdir(spec["wheels"]) else []
+            since = time.monotonic()
+            run([shutil.which("uv") or "uv", "pip", "install", "--python", python] + find_links + what,
+                "install the dependencies", cwd=tree)
             took("installed", since)
             if spec["cache_store"]:
                 # What it downloaded is out, what it built stays: the cache is
                 # then only the wheels nobody publishes for this machine.
-                subprocess.run([uv, "cache", "prune", "--ci", "-q"], stdin=subprocess.DEVNULL)
-                cache("push", sys.executable, ("uv",))
-                wheels_report()
-        else:
-            run([python, "-m", "pip", "install", "--disable-pip-version-check", "-q"] + find_links + what,
-                "install the dependencies", cwd=tree)
-            took("installed", since)
-    with open(ready, "w", encoding="utf-8") as handle:
-        json.dump({"python": python}, handle)
+                subprocess.run([shutil.which("uv") or "uv", "cache", "prune", "--ci", "-q"], stdin=subprocess.DEVNULL)
+                cache("push", python, ("uv",))
+                wheels_report(python)
+        with open(ready, "w", encoding="utf-8") as handle:
+            json.dump({"python": python}, handle)
+    root = os.path.realpath(tree)
+    script = os.path.realpath(os.path.join(root, spec["script"]))
+    # Inside the checkout and a file of it: a link that leads out is refused too.
+    if os.path.commonpath([script, root]) != root or not os.path.isfile(script):
+        fail("%s has no file %s to run" % (short, spec["script"]))
+else:
+    script = spec["script"]
+    if script.startswith("ravex:"):
+        # A file of the Ravex release the template names: its examples and
+        # benches, which the wheel does not carry.
+        out = os.path.join(spec["envs"], ".tree-%d.json" % os.getpid())
+        run([sys.executable, spec["environment_script"], "tree", "--ravex", spec["template"]["ravex"],
+             "--root", spec["envs"], "--out", out], "fetch Ravex %s's scripts" % spec["template"]["ravex"])
+        with open(out, encoding="utf-8") as handle:
+            root = os.path.realpath(json.load(handle)["tree"])
+        os.remove(out)
+        script = os.path.realpath(os.path.join(root, script[len("ravex:"):]))
+        if os.path.commonpath([script, root]) != root or not os.path.isfile(script):
+            fail("Ravex %s has no %s" % (spec["template"]["ravex"], spec["script"][len("ravex:"):]))
+    root = os.path.dirname(script)
+
+# The agent reads it for the Python of the rendezvous, the cache and the run's shipping.
+with open(spec["ready"], "w", encoding="utf-8") as handle:
+    json.dump({"python": python}, handle)
 
 # The kernels with the interpreter that will compile them: a torch the
 # repository installed in its environment is a key of its own.
 cache("pull", python, ("triton", "inductor", "tilelang"))
-
-root = os.path.realpath(tree)
-script = os.path.realpath(os.path.join(root, spec["script"]))
-# Inside the checkout and a file of it: a link that leads out is refused too.
-if os.path.commonpath([script, root]) != root or not os.path.isfile(script):
-    fail("%s has no file %s to run" % (short, spec["script"]))
 
 if spec["gpus"] > 1:
     command = [python, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node", str(spec["gpus"]),
@@ -626,7 +687,7 @@ if spec["gpus"] > 1:
 else:
     command = [python, "-c", spec["launcher"], script]
 command += spec["flags"]
-say("running %s, %.1f s after the job started" % (spec["script"], time.monotonic() - began))
+say("running %s, %.1f s after the job started" % (os.path.basename(script), time.monotonic() - began))
 os.chdir(root)
 if os.name == "nt":
     # No exec on Windows: wait for the training, and leave a stop to it.
@@ -673,19 +734,24 @@ class Config:
     #: Whether it takes jobs that bring a repository's commit to run (see
     #: "Code from a repository" above). Off unless asked for.
     code: bool = False
-    #: Whether it checks at start that its GPUs work (``_GPU_CHECK``), and
-    #: takes no job if they do not. On by default for hardware named
-    #: ``gpu...``; ``check_gpus`` / ``SMITH_CHECK_GPUS`` say otherwise.
+    #: Whether its first job checks that the GPUs work (``_GPU_CHECK``), with
+    #: the torch of that job's environment, and the machine takes no other if
+    #: they do not. On by default for hardware named ``gpu...``;
+    #: ``check_gpus`` / ``SMITH_CHECK_GPUS`` say otherwise.
     check_gpus: bool = False
     #: Whether a job's compiled dependencies are kept in the backend's cache,
     #: through URLs it signs (see "What one machine compiled" above). Off
     #: unless asked for: a backend without one would refuse every pull.
     cache_service: bool = False
-    #: The manifest of the heavy part of this Python - torch, its CUDA
-    #: libraries - which the image does not carry and ``runtime.py`` fetches
-    #: and installs before the first job (``runtime`` in the file); None where
-    #: the environment already has it all.
-    runtime: Optional[str] = None
+    #: The folder of the image's PyTorch locks, one per Python
+    #: (``cp312.json``), which ``runtime.py`` installs into a job's
+    #: environment (GPU-523); None installs PyTorch's CPU build from its index.
+    locks: Optional[str] = None
+    #: The Pythons a job's template may ask for here, and the PyTorch it
+    #: gets: from the locks, or the file's ``pythons`` and ``torch`` without
+    #: them. A backend hands this agent only the jobs it can make.
+    pythons: List[str] = field(default_factory=list)
+    torch: str = ""
     #: Minutes without a word from the backend after which the job is
     #: stopped and the machine ended (see "A node the backend no longer
     #: answers" above); 0 never.
@@ -711,10 +777,16 @@ class Config:
             script = entry.get("path") if isinstance(entry, dict) else entry
             if not script:
                 raise SystemExit("scripts.%s has no path" % key)
-            resolved = resolve(script)
-            if not os.path.isfile(resolved):
-                raise SystemExit("scripts.%s: %s does not exist" % (key, resolved))
-            scripts[key] = resolved
+            if str(script).startswith("ravex:"):
+                # A file of the job's Ravex release (GPU-523), fetched with it.
+                if not _RELATIVE.fullmatch(str(script)[len("ravex:"):]):
+                    raise SystemExit("scripts.%s: %s is not a file of Ravex's source" % (key, script))
+                scripts[key] = str(script)
+            else:
+                resolved = resolve(script)
+                if not os.path.isfile(resolved):
+                    raise SystemExit("scripts.%s: %s does not exist" % (key, resolved))
+                scripts[key] = resolved
             model_params[key] = [str(name) for name in (entry.get("model") or [])] if isinstance(entry, dict) else []
             given = entry.get("params") if isinstance(entry, dict) else None
             if given is not None and not isinstance(given, dict):
@@ -732,6 +804,11 @@ class Config:
             if env("SMITH_STORAGE_" + key.upper()):
                 table[key] = env("SMITH_STORAGE_" + key.upper())
         storage = Bucket.from_table(table, path)
+        locks = resolve(raw["locks"]) if raw.get("locks") else None
+        pythons, torch = runtimes_of(locks) if locks else (
+            [str(python) for python in raw.get("pythons") or []], str(raw.get("torch") or ""))
+        if not pythons or not torch:
+            raise SystemExit("%s says no Pythons or PyTorch a job may ask for: locks, or pythons and torch" % path)
         return cls(
             backend=str(env("SMITH_BACKEND") or raw.get("backend", "http://127.0.0.1:8600")).rstrip("/"),
             name=str(env("SMITH_NAME") or raw.get("name") or socket.gethostname()),
@@ -756,10 +833,29 @@ class Config:
                 or raw.get("check_gpus", str(env("SMITH_HARDWARE") or raw.get("hardware", "local-cpu")).startswith("gpu"))
             ).lower() in ("true", "1", "yes"),
             cache_service=str(env("SMITH_CACHE") or raw.get("cache", "")).lower() == "backend",
-            runtime=resolve(raw["runtime"]) if raw.get("runtime") else None,
+            locks=locks,
+            pythons=pythons,
+            torch=torch,
             alone_minutes=max(0.0, float(env("SMITH_ALONE_MINUTES") or raw.get("alone_minutes", 0) or 0)),
             price_per_hour=float(env("SMITH_PRICE_PER_HOUR") or raw.get("price_per_hour", 0) or 0) or None,
         )
+
+
+def runtimes_of(locks: str) -> Tuple[List[str], str]:
+    """The Pythons the image has a PyTorch lock for, and that PyTorch, read
+    from the locks' file names and torch's wheel in them."""
+    pythons, torch = [], ""
+    for name in sorted(os.listdir(locks)):
+        found = re.fullmatch(r"cp3([0-9]{1,2})\.json", name)
+        if not found:
+            continue
+        pythons.append("3." + found.group(1))
+        with open(os.path.join(locks, name), encoding="utf-8") as handle:
+            for entry in json.load(handle).get("files", []):
+                wheel = re.match(r"torch-([^-]+)-", entry.get("name", ""))
+                if wheel:
+                    torch = wheel.group(1).replace("%2B", "+")
+    return sorted(pythons, key=lambda p: int(p.split(".")[1])), torch
 
 
 @dataclass
@@ -1253,6 +1349,9 @@ class Running:
     def __init__(self, job: Dict[str, Any], config: Config) -> None:
         #: The rendezvous this agent serves for the run, if it hosts it.
         self.rendezvous: Optional[subprocess.Popen] = None
+        #: The port it serves the run's rendezvous on once its environment is
+        #: ready, which the rendezvous needs Ravex from; None when it serves none.
+        self.serve_port: Optional[int] = None
         try:
             self._start(job, config)
         except BaseException:
@@ -1278,6 +1377,8 @@ class Running:
         #: this agent's own scripts.
         self.code = self._checked_code(job, config) if job.get("code") else None
         script = config.scripts[job["script"]] if self.code is None else ""
+        #: What it trains with (GPU-523), which this machine must be able to make.
+        self.template = self._checked_template(job, config)
         env = dict(os.environ)
         # The secrets a backend gave this job: its HF_TOKEN, its W&B key. In
         # the training process's environment only - never this agent's own,
@@ -1472,17 +1573,16 @@ class Running:
             port = int(serve)
             if not 1024 <= port <= 65535:
                 raise RuntimeError("port %d is not one a rendezvous can listen on" % port)
-            # Before the script, which dials it. Its output beside the job's;
-            # its token from the environment, never its command line.
-            self._rendezvous_log = open(os.path.join(logs, "job-%d.rendezvous.log" % self.id), "ab")
-            self.rendezvous = subprocess.Popen(
-                [config.python, "-m", "ravex._cli", "rendezvous", "--host", "0.0.0.0", "--port", str(port)],
-                env=env,
-                stdout=self._rendezvous_log,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-            )
-            log("job %d: serving the run's rendezvous on port %d, pid %d" % (self.id, port, self.rendezvous.pid))
+            # Started once the environment is ready (``serve_when_ready``):
+            # the script, which dials it, starts after that too.
+            self.serve_port = port
+        self.env = env
+        #: What the preparer made, and why the machine failed, if it did.
+        self.ready_path = os.path.join(logs, "job-%d.ready" % self.id)
+        self.fault_path = os.path.join(logs, "job-%d.fault" % self.id)
+        for stale in (self.ready_path, self.fault_path):
+            if os.path.exists(stale):
+                os.remove(stale)
         launcher = os.path.join(logs, "_launcher.py")
         if config.gpus > 1:
             # torchrun wants a file, not `-c`. One process per GPU, on this
@@ -1491,44 +1591,53 @@ class Running:
             # the signal is sent to.
             with open(launcher, "w", encoding="utf-8") as handle:
                 handle.write(_LAUNCHER)
+        # The preparer makes the environment, fetches a repository's commit,
+        # and becomes the training; what it needs in its environment, the
+        # token apart from the rest so it can drop it before the training.
         if self.code is not None:
-            # The preparer fetches the commit and becomes the training; what
-            # it needs in its environment, the token apart from the rest so
-            # it can drop it before the training starts.
             os.makedirs(self.code["root"], exist_ok=True)
-            env["SMITH_PREPARE"] = json.dumps(
-                {
-                    "repo": self.code["repo"],
-                    "commit": self.code["commit"],
-                    "script": job["script"],
+        envs = os.path.join(config.runs, "_envs")
+        os.makedirs(envs, exist_ok=True)
+        env["SMITH_PREPARE"] = json.dumps(
+            {
+                "template": self.template,
+                "envs": envs,
+                "environment_script": ENVIRONMENT_SCRIPT,
+                "locks": config.locks,
+                "signed": "%s/api/cache/global" % config.backend if config.cache_service and config.token else None,
+                "gpu": config.hardware.startswith("gpu"),
+                "gpu_check": config.check_gpus,
+                "gpu_check_script": _GPU_CHECK,
+                "gpu_check_seconds": GPU_CHECK_SECONDS,
+                "gpu_checked": os.path.join(config.runs, "_logs", ".gpus-checked"),
+                "fault_file": self.fault_path,
+                "ready": self.ready_path,
+                "code": None if self.code is None else {
+                    "repo": self.code["repo"], "commit": self.code["commit"],
                     "tree": os.path.join(self.code["root"], self.code["commit"]),
-                    "gpus": config.gpus,
-                    "launcher": _LAUNCHER,
-                    "launcher_file": launcher,
-                    "flags": flags(job.get("params") or {}),
-                    "caches": self.caches,
-                    "cache_script": CACHE_SCRIPT,
-                    "cache_reads": self.cache_reads,
-                    "cache_store": self.cache_store,
-                    "wheels": self.wheels,
-                    "wheels_store": self.wheels_store,
-                    "wheels_report": self.wheels_report,
-                }
-            )
-            if self.code.get("token"):
-                env["SMITH_GIT_TOKEN"] = str(self.code["token"])
-            command = [config.python, "-c", _PREPARE]
-            workdir = self.code["root"]
-        else:
-            if config.gpus > 1:
-                command = [
-                    config.python, "-m", "torch.distributed.run", "--standalone",
-                    "--nproc_per_node", str(config.gpus), launcher, script,
-                ]
-            else:
-                command = [config.python, "-c", _LAUNCHER, script]
-            command += flags(job.get("params") or {})
-            workdir = os.path.dirname(script)
+                },
+                "script": job["script"] if self.code is not None else script,
+                "gpus": config.gpus,
+                "launcher": _LAUNCHER,
+                "launcher_file": launcher,
+                "flags": flags(job.get("params") or {}),
+                "caches": self.caches,
+                "cache_script": CACHE_SCRIPT,
+                "cache_reads": self.cache_reads,
+                "cache_store": self.cache_store,
+                "wheels": self.wheels,
+                "wheels_store": self.wheels_store,
+                "wheels_report": self.wheels_report,
+            }
+        )
+        if config.cache_service and config.token:
+            # The runtime's wheels come from the backend's cache, through URLs
+            # it signs for this token (``runtime.py --signed``).
+            self.cache_env.setdefault("SMITH_CACHE_TOKEN", config.token)
+        if self.code is not None and self.code.get("token"):
+            env["SMITH_GIT_TOKEN"] = str(self.code["token"])
+        command = [config.python, "-c", _PREPARE]
+        workdir = config.runs
         extra: Dict[str, Any] = {}
         if os.name == "nt":
             # Its own group, so CTRL_BREAK reaches it and not this agent.
@@ -1548,6 +1657,58 @@ class Running:
             "job %d (%s, %s) started as run %s, pid %d; output in %s"
             % (self.id, job["name"], job["mode"], self.run_id, self.process.pid, self.log_path)
         )
+
+    @staticmethod
+    def _checked_template(job: Dict[str, Any], config: Config) -> Dict[str, str]:
+        """The job's template, which this machine must be able to make: a
+        Python it has a PyTorch for, and that PyTorch's version (GPU-523)."""
+        template = job.get("template")
+        if not isinstance(template, dict):
+            raise RuntimeError("the job says nothing of the libraries it trains with (its template)")
+        python, torch = str(template.get("python") or ""), str(template.get("torch") or "")
+        if python not in config.pythons:
+            raise RuntimeError("this machine makes Python %s, not %s" % (", ".join(config.pythons), python))
+        if torch.split("+", 1)[0] != config.torch.split("+", 1)[0]:
+            raise RuntimeError("this machine has PyTorch %s, not %s" % (config.torch, torch))
+        return {key: str(template.get(key) or "") for key in ("python", "torch", "ravex", "moonclip")}
+
+    def python(self) -> Optional[str]:
+        """The Python the training ran in, once the preparer made it."""
+        try:
+            with open(self.ready_path, encoding="utf-8") as handle:
+                return str(json.load(handle)["python"])
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def fault(self) -> Optional[str]:
+        """What the preparer found wrong with this machine: its GPUs."""
+        try:
+            with open(self.fault_path, encoding="utf-8") as handle:
+                return handle.read().strip() or None
+        except OSError:
+            return None
+
+    def serve_when_ready(self) -> None:
+        """Start serving the run's rendezvous once the environment is made,
+        with its Python, which has Ravex. Before the script, which dials it,
+        as the preparer starts that only after writing the ready file; the
+        other nodes' scripts wait for it, within their deadline."""
+        if self.serve_port is None or self.rendezvous is not None:
+            return
+        python = self.python()
+        if python is None:
+            return
+        logs = os.path.dirname(self.ready_path)
+        # Its output beside the job's; its token from the environment, never its command line.
+        self._rendezvous_log = open(os.path.join(logs, "job-%d.rendezvous.log" % self.id), "ab")
+        self.rendezvous = subprocess.Popen(
+            [python, "-m", "ravex._cli", "rendezvous", "--host", "0.0.0.0", "--port", str(self.serve_port)],
+            env=self.env,
+            stdout=self._rendezvous_log,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+        )
+        log("job %d: serving the run's rendezvous on port %d, pid %d" % (self.id, self.serve_port, self.rendezvous.pid))
 
     @staticmethod
     def _checked_code(job: Dict[str, Any], config: Config) -> Dict[str, Any]:
@@ -1637,11 +1798,8 @@ class Running:
         """
         if not self.cache_store or self.code is None:
             return None
-        ready = os.path.join(self.code["root"], self.code["commit"], ".smith-ready")
-        try:
-            with open(ready, encoding="utf-8") as handle:
-                python = json.load(handle)["python"]
-        except (OSError, ValueError, KeyError):
+        python = self.python()
+        if python is None:
             return None
         kernels = [entry for entry in self.caches if entry[0] != "uv"]
         spec: Dict[str, Any] = {"python": python, "store": self.cache_store, "caches": kernels,
@@ -1707,6 +1865,9 @@ class Agent:
         #: Stores of finished runs whose leftovers still have to reach the
         #: backend, and when to try next.
         self.to_ship: Dict[str, float] = {}
+        #: Per store, the Python its job trained in, which ``ravex ship`` runs
+        #: with: this agent's own has no Ravex (GPU-523).
+        self.ship_python: Dict[str, str] = {}
         self.shipping: Optional[tuple] = None
         #: The output of every job still being sent: the running one, and any
         #: that ended while the backend was not answering.
@@ -1806,83 +1967,6 @@ class Agent:
             log("%s: deletion asked for" % what)
             return
 
-    def install_runtime(self) -> None:
-        """Fetch and install the heavy part of the job's Python before
-        anything else, the GPU check included, which imports torch.
-
-        Before the first heartbeat too: a backend that heard this agent would
-        hand it a job it could not start yet. Fetching takes a minute or two,
-        well inside the time a backend gives a node to come up. One that
-        fails is this machine's fault, said in every heartbeat, so the
-        backend gives its job to another instead of waiting on this one."""
-        runtime = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime.py")
-        log("installing the runtime from %s" % self.config.runtime)
-        command, env = self.runtime_command(runtime)
-        try:
-            done = subprocess.run(
-                command,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=RUNTIME_SECONDS,
-            )
-            for line in (done.stdout or "").splitlines():
-                log(line)
-            if done.returncode != 0:
-                said = [line for line in (done.stderr or "").splitlines() if line.strip()]
-                self.fault = "the runtime could not be installed: %s" % (said[-1] if said else "no answer")
-        except subprocess.TimeoutExpired:
-            self.fault = "the runtime was not installed in %d seconds" % RUNTIME_SECONDS
-        except OSError as exc:
-            self.fault = "the runtime could not start installing: %s" % exc
-        if self.fault:
-            log("%s; this machine takes no job" % self.fault)
-
-    def runtime_command(self, runtime: str) -> Tuple[List[str], Dict[str, str]]:
-        """The command that installs the runtime, and its environment.
-
-        With the backend's cache (``SMITH_CACHE=backend``) the wheels come
-        from its read-only ``global`` scope first, through URLs it signs for
-        this agent's token, as a job's compiled dependencies do. The token
-        goes in the environment, as ``SMITH_CACHE_TOKEN`` like ``cache.py``'s,
-        and never on the command line, which any user of the machine can
-        read."""
-        command = [self.config.python, runtime, "install", "--manifest", self.config.runtime,
-                   "--python", self.config.python]
-        env = dict(os.environ)
-        if self.config.cache_service and self.config.token:
-            command += ["--signed", "%s/api/cache/global" % self.config.backend]
-            env["SMITH_CACHE_TOKEN"] = self.config.token
-        return command, env
-
-    def check_gpus(self) -> None:
-        """Run the GPU check once, before the first job."""
-        try:
-            done = subprocess.run(
-                [self.config.python, "-c", _GPU_CHECK, str(self.config.gpus)],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=GPU_CHECK_SECONDS,
-            )
-            # Its own last line; failing that, Python's, for a check that
-            # died before it could say anything.
-            said = [line for line in (done.stdout or "").splitlines() if line.strip()] or [
-                line for line in (done.stderr or "").splitlines() if line.strip()
-            ]
-            last = said[-1] if said else "no answer"
-            if done.returncode != 0:
-                self.fault = "the GPU check failed: %s" % last
-            else:
-                log("GPUs checked: %s" % last)
-        except subprocess.TimeoutExpired:
-            self.fault = "the GPU check did not finish in %d seconds" % GPU_CHECK_SECONDS
-        except OSError as exc:
-            self.fault = "the GPU check could not start: %s" % exc
-        if self.fault:
-            log("%s; this machine takes no job" % self.fault)
-
     def beat(self) -> None:
         self.backend.call(
             "POST",
@@ -1934,6 +2018,9 @@ class Agent:
                 "scripts": sorted(self.config.scripts),
                 "hardware": self.config.hardware,
                 "code": self.config.code,
+                # What a job's template may ask for here (GPU-523).
+                "pythons": self.config.pythons,
+                "torch": self.config.torch,
             },
         )
         if not job:
@@ -1954,9 +2041,16 @@ class Agent:
     def watch(self) -> None:
         running = self.current
         assert running is not None
+        running.serve_when_ready()
         code = running.process.poll()
         if code is not None:
             running.close()
+            fault = running.fault()
+            if fault:
+                # The GPU check, run by the preparer: this machine takes no
+                # job, and its heartbeat says why.
+                self.fault = fault
+                log("%s; this machine takes no job" % fault)
             if running.rendezvous is not None:
                 self.serving = running
                 log("job %d ended; still serving its run's rendezvous for the other nodes" % running.id)
@@ -1970,6 +2064,8 @@ class Agent:
                 state, message = "failed", "stopped on request"
             elif code == 0:
                 state, message = "finished", None
+            elif fault:
+                state, message = "failed", fault
             else:
                 state, message = "failed", "exit code %d\n%s" % (code, running.tail())
             log("job %d %s (exit code %d)" % (running.id, "stopped" if running.stop_requested_at else state, code))
@@ -1977,7 +2073,11 @@ class Agent:
             # Always, not only after an outage: it is how the final status
             # arrives when the run's own last attempt did not, and on a store
             # with nothing left it sends the run document again and no points.
-            self.to_ship[running.store] = time.monotonic()
+            python = running.python()
+            if python is not None:
+                # With the training's own Python, which has Ravex.
+                self.to_ship[running.store] = time.monotonic()
+                self.ship_python[running.store] = python
             pushing = running.push_caches(self.config)
             if pushing is not None:
                 self.pushing.append(pushing)
@@ -2065,6 +2165,7 @@ class Agent:
             self.shipping = None
             if code == 0:
                 del self.to_ship[store]
+                self.ship_python.pop(store, None)
                 if not first:
                     log("what %s had left reached the backend" % store)
             else:
@@ -2082,7 +2183,7 @@ class Agent:
             if abs(due) <= now:
                 process = subprocess.Popen(
                     [
-                        self.config.python, "-m", "ravex._cli", "ship",
+                        self.ship_python[store], "-m", "ravex._cli", "ship",
                         "--storage", store, "--endpoint", self.config.backend, "--wait", "60",
                     ],
                     stdout=subprocess.DEVNULL,
@@ -2177,10 +2278,6 @@ class Agent:
                 else "s3://%s/%s, staged in %s" % (bucket.bucket, bucket.prefix, self.config.runs),
             )
         )
-        if self.config.runtime:
-            self.install_runtime()
-        if self.config.check_gpus and self.fault is None:
-            self.check_gpus()
         self.reconcile()
         self.start_spot_watch()
         polled = 0.0

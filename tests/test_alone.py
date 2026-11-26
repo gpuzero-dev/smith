@@ -19,6 +19,7 @@ import urllib.error
 import pytest
 
 import smith
+from made import RUNTIMES, TEMPLATE, made
 
 
 def _agent(minutes=30.0):
@@ -100,7 +101,7 @@ def test_the_limit_is_off_at_zero_and_counts_minutes():
 
 def test_the_setting_comes_from_the_environment(tmp_path, monkeypatch):
     path = tmp_path / "smith.toml"
-    path.write_text('code = true\n')
+    path.write_text('code = true\npythons = ["3.12"]\ntorch = "2.11.0+cpu"\n')
     assert smith.Config.load(str(path)).alone_minutes == 0
     monkeypatch.setenv("SMITH_ALONE_MINUTES", "30")
     assert smith.Config.load(str(path)).alone_minutes == 30
@@ -108,7 +109,7 @@ def test_the_setting_comes_from_the_environment(tmp_path, monkeypatch):
 
 def test_the_price_comes_from_the_environment(tmp_path, monkeypatch):
     path = tmp_path / "smith.toml"
-    path.write_text('code = true\n')
+    path.write_text('code = true\npythons = ["3.12"]\ntorch = "2.11.0+cpu"\n')
     assert smith.Config.load(str(path)).price_per_hour is None
     monkeypatch.setenv("SMITH_PRICE_PER_HOUR", "1.89")
     assert smith.Config.load(str(path)).price_per_hour == 1.89
@@ -256,9 +257,10 @@ def test_a_job_is_not_given_what_is_the_agents_alone(tmp_path, monkeypatch):
     monkeypatch.setenv("MOONCLIP_S3_SECRET_KEY", "agents-secret")
     config = smith.Config(backend="http://127.0.0.1:1", name="n", hardware="h", runs=str(tmp_path / "runs"),
                           python=sys.executable, scripts={"show": str(script)}, token="agent-token",
-                          price_per_hour=1.89)
+                          price_per_hour=1.89, **RUNTIMES)
+    made(tmp_path / "runs")
     job = {"id": 1, "script": "show", "mode": "fresh", "name": "n", "run_ref": "r-001", "params": {},
-           "storage": {"type": "s3", "bucket": "theirs", "region": "eu-west-1"}}
+           "storage": {"type": "s3", "bucket": "theirs", "region": "eu-west-1"}, "template": TEMPLATE}
     running = smith.Running(job, config)
     running.process.wait(timeout=60)
     with open(running.log_path, encoding="utf-8") as handle:

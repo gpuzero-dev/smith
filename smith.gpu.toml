@@ -11,11 +11,15 @@ backend = "http://127.0.0.1:8600"
 hardware = "gpu"
 # Staging for the stores, which live in the bucket; and _logs/.
 runs = "/runs"
-# torch and its CUDA libraries, which the image does not carry: fetched and
-# installed by runtime.py before the first job: from the backend's cache when
-# the node uses it (SMITH_CACHE=backend), else from a mirror if
-# SMITH_RUNTIME_URL is set, else from the index they were resolved from.
-runtime = "/app/runtime.json"
+# torch and its CUDA libraries, locked once per Python the image offers
+# (cp311.json, cp312.json, ...): the image carries the locks, not the wheels.
+# A job's environment is made from its template (GPU-523) - that Python, the
+# lock's torch installed by runtime.py from the backend's cache when the node
+# uses it (SMITH_CACHE=backend), else from a mirror if SMITH_RUNTIME_URL is
+# set, else from the index - then the job's Ravex and Moonclip, and kept for
+# the next job with the same template. The Pythons a job may ask for, and the
+# torch, are read from the locks.
+locks = "/app/runtime"
 
 # The bucket every run's store goes to, under <prefix>/<run id>. A pod is gone
 # once it stops, and the bucket is what lets a run resume or fork on another.
@@ -28,15 +32,15 @@ runtime = "/app/runtime.json"
 
 [scripts]
 # `model` and `params`: see smith.docker.toml.
-spiral = { path = "/app/examples/spiral.py", model = ["width"], params = { lr = 5e-3, steps = 3000 } }
+spiral = { path = "ravex:examples/spiral.py", model = ["width"], params = { lr = 5e-3, steps = 3000 } }
 # What log_metrics costs a step on this card: ravex's bench, printed to the
 # job's output. Not a training run - it makes one small store per arm.
-metrics_cost = { path = "/app/bench/metrics_cost.py", params = { steps = 600 } }
+metrics_cost = { path = "ravex:bench/metrics_cost.py", params = { steps = 600 } }
 # What quantizing an outer delta costs on this card - torch on CPU, torch on
 # CUDA, and ravex's TileLang kernel - after checking the kernel writes the
 # torch path's bytes (GPU-139). Prints CHECK OK or CHECK FAILED first.
-quant_cost = { path = "/app/bench/quant_cost.py", params = { elements = 67108864, repeat = 3 } }
+quant_cost = { path = "ravex:bench/quant_cost.py", params = { elements = 67108864, repeat = 3 } }
 # What the default pre-training metrics cost a 1B decoder's step on this card
 # (GPU-436): trained with nothing but the decorator, in the job's own run, so
 # its metrics page shows them too. Needs a card with about 40 GB.
-pretraining_cost = { path = "/app/bench/pretraining_cost.py", params = { steps = 300 } }
+pretraining_cost = { path = "ravex:bench/pretraining_cost.py", params = { steps = 300 } }
