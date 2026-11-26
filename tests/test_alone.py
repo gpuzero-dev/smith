@@ -45,6 +45,12 @@ def test_a_5xx_is_silence_and_a_4xx_is_an_answer(monkeypatch):
     with pytest.raises(smith.Refusal):
         backend.call("GET", "/api/jobs")
     assert backend.silent_for() >= 100
+    # A token refused is no answer either (GPU-530): the machine is alone.
+    for code in (401, 403):
+        answer(code)
+        with pytest.raises(smith.Refusal):
+            backend.call("GET", "/api/jobs")
+        assert backend.silent_for() >= 100
     answer(404)
     with pytest.raises(smith.Refusal):
         backend.call("GET", "/api/jobs")
@@ -143,14 +149,17 @@ def test_giving_up_stops_the_job_waits_for_it_and_exits(monkeypatch):
     assert deleted == []
 
 
-def test_the_loop_gives_up_once_the_backend_has_been_silent(monkeypatch):
+@pytest.mark.parametrize("refusal", [smith.Unreachable("down"), smith.Refusal("POST /api/agents/heartbeat: 401", 401)])
+def test_the_loop_gives_up_once_the_backend_has_been_silent(monkeypatch, refusal):
+    """Silent, or refusing its token (GPU-530): a node whose token is
+    refused is never heard again, and gives its machine back too."""
     agent = _agent()
     agent.backend.heard_at = time.monotonic() - 31 * 60
     for name in ("reconcile", "start_spot_watch", "send_logs", "ship", "take"):
         monkeypatch.setattr(agent, name, lambda: None)
 
     def beat():
-        raise smith.Unreachable("down")
+        raise refusal
 
     monkeypatch.setattr(agent, "beat", beat)
     monkeypatch.setattr(agent, "end_machine", lambda: None)

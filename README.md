@@ -185,7 +185,8 @@ stopped as a cancel does, so Ravex writes its last checkpoint, and no further jo
 is taken. The job is reported with state `interrupted` (`failed` to a backend that
 refuses it), for a backend that carries runs on from a machine taken back.
 `SMITH_ALONE_MINUTES` (30 in the GPU image, off unless set elsewhere): after
-that long without an answer from the backend - nothing, or only 5xx - the
+that long without an answer from the backend - nothing, only 5xx, or only
+401 or 403, its token refused - the
 running job is stopped as a cancel does, so Ravex writes its last checkpoint to
 the bucket, and the machine is given back: on RunPod and vast.ai smith deletes
 its own pod or instance with the key the provider puts in it (`RUNPOD_API_KEY`,

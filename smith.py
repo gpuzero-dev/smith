@@ -133,8 +133,9 @@ are the backend's to enforce: its reaper gives a machine back. With the
 backend down nobody does, and a customer's GPUs would stay on, billed to
 their account, for as long as the outage lasts. So with ``alone_minutes``
 (``SMITH_ALONE_MINUTES``; 30 in the GPU image, off elsewhere) an agent that
-has heard nothing from the backend for that long - no answer at all, or only
-5xx, which is what a proxy in front of a stopped backend sends - stops its
+has heard nothing from the backend for that long - no answer at all, only
+5xx, which is what a proxy in front of a stopped backend sends, or only a
+401 or 403, a token it no longer takes (GPU-530) - stops its
 job as a cancel does, so Ravex writes its last checkpoint to the bucket, and
 then ends the machine. On RunPod and vast.ai it deletes its own pod or
 instance with the key the provider puts in every one for that
@@ -1073,6 +1074,12 @@ class Refusal(RuntimeError):
         self.status = status
 
 
+#: What a backend answers a token it does not take. Not an answer to count
+#: as heard (GPU-530): a node whose token was revoked, or whose row is gone,
+#: polled every two seconds for ever and never gave its machine back.
+TOKEN_REFUSED = (401, 403)
+
+
 class Backend:
     def __init__(self, base: str, token: Optional[str] = None) -> None:
         self.base = base
@@ -1096,10 +1103,12 @@ class Backend:
                 answer = json.loads(response.read().decode("utf-8") or "null")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
-            if exc.code < 500:
+            if exc.code < 500 and exc.code not in TOKEN_REFUSED:
                 # A refusal is an answer: whoever refused is there, and so
                 # is its reaper. A 5xx is not one - it is what a CDN or a
-                # proxy says for a backend that has stopped.
+                # proxy says for a backend that has stopped - nor is a token
+                # refused: that backend will never hear this machine again,
+                # and only the agent itself can give it back.
                 self.heard_at = time.monotonic()
             raise Refusal("%s %s: %d %s" % (method, path, exc.code, detail), exc.code) from None
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
@@ -2387,7 +2396,7 @@ class Agent:
                 every = backoff(every)
             except RuntimeError as exc:
                 log(str(exc))
-                if isinstance(exc, Refusal) and exc.status >= 500:
+                if isinstance(exc, Refusal) and (exc.status >= 500 or exc.status in TOKEN_REFUSED):
                     every = backoff(every)
             if self.alone():
                 self.give_up()
