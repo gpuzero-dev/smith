@@ -65,8 +65,19 @@ is gone once it stops; a store in the bucket is what lets "Resume" and "Fork"
 work on another one. The run reports ``s3://bucket/prefix`` as its address,
 and a resume or fork on any agent with the same bucket starts from there. The
 bucket's keys come from the environment, ``MOONCLIP_S3_ACCESS_KEY`` and
-``MOONCLIP_S3_SECRET_KEY``, never from this file; the jobs inherit them, and
-Moonclip, which writes the store, reads them there (GPU-267).
+``MOONCLIP_S3_SECRET_KEY``, never from this file; a job whose store goes to
+that bucket is given them, and Moonclip, which writes the store, reads them
+there (GPU-267). No other job is (GPU-530).
+
+**What a job is not given (GPU-530).** No variable of this agent's whose
+name has a part ``KEY``, ``SECRET``, ``TOKEN``, ``PASSWORD`` or
+``CREDENTIALS`` reaches the job, ``ravex ship`` or the kernels' push: not
+this agent's token, not the provider's key that deletes the machine
+(``RUNPOD_API_KEY``, ``CONTAINER_API_KEY``), not its bucket's keys unless the
+job's store is there. What a job needs comes with the job. The job still runs
+as this agent's user, and could read the agent's own environment under
+``/proc``; and the token it reports its metrics with is this agent's, until a
+backend hands one per job.
 
 **The token.** ``SMITH_TOKEN`` in the environment (or ``token`` in the
 configuration, for a machine where that is how secrets arrive): sent as a
@@ -870,9 +881,10 @@ class Bucket:
     endpoint: Optional[str] = None
     region: Optional[str] = None
     path_style: bool = False
-    #: The bucket's own keys, when a backend handed one with a job. Unset,
-    #: the run takes this agent's MOONCLIP_S3_* from the environment. Out of
-    #: the repr, so that printing a bucket never prints them.
+    #: The bucket's keys: those a backend handed with a job, or for this
+    #: agent's bucket its MOONCLIP_S3_*, read once at start so that they reach
+    #: a job only when its store goes there (GPU-530). Out of the repr, so
+    #: that printing a bucket never prints them.
     access_key: Optional[str] = field(default=None, repr=False)
     secret_key: Optional[str] = field(default=None, repr=False)
     #: With temporary keys, the token they sign nothing without: a backend
@@ -930,6 +942,9 @@ class Bucket:
             region=table.get("region"),
             # From TOML a bool, from the environment a string: "false" is not true.
             path_style=str(table.get("path_style", False)).lower() in ("true", "1", "yes"),
+            access_key=os.environ["MOONCLIP_S3_ACCESS_KEY"],
+            secret_key=os.environ["MOONCLIP_S3_SECRET_KEY"],
+            session_token=os.environ.get("MOONCLIP_S3_SESSION_TOKEN") or None,
         )
 
     def prefix_of(self, run_id: str) -> str:
@@ -1162,6 +1177,32 @@ SECRET_PREFIXES_NOT_TAKEN = ("RAVEX_", "SMITH_", "MOONCLIP_", "PYTHON", "LD_", "
 SECRET_NAMES_NOT_TAKEN = frozenset({"PATH", "HOME", "BROWSER", "BASH_ENV", "ENV", "IFS"})
 
 
+#: The words that make a variable a secret (GPU-530), as a part of its name
+#: between underscores: ``SMITH_TOKEN``, ``RUNPOD_API_KEY``,
+#: ``CONTAINER_API_KEY``, ``MOONCLIP_S3_SECRET_KEY``, ``AWS_ACCESS_KEY_ID``.
+SECRET_WORDS = frozenset({"KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIALS"})
+
+
+def without_secrets(environ: Any) -> Dict[str, str]:
+    """``environ`` without the secrets in it, for a process that runs code a
+    job can influence: the training, ``ravex ship`` and the kernels' push,
+    which run in the job's environment, from packages it installed.
+
+    This agent's environment holds what is the machine's and not the job's
+    (GPU-530): the provider's key that deletes the pod, which a script would
+    have taken along with everything else, and this agent's own bucket keys.
+    So a secret is passed on only by name, by smith, where it is the job's:
+    its ``secrets``, its bucket's keys - or this agent's, when its store goes
+    to this agent's bucket - the run's token, the metrics token. A secret set
+    in the shell that starts smith on a laptop goes no further either; one
+    that a job needs comes with it, as a secret of the job.
+
+    Not a boundary on its own: the job runs as this agent's user, which can
+    read the agent's environment under /proc. What it stops is a script, or
+    a library that reports its environment, carrying them off by accident."""
+    return {name: value for name, value in environ.items() if not SECRET_WORDS.intersection(name.upper().split("_"))}
+
+
 def job_secrets(job: Dict[str, Any]) -> Dict[str, str]:
     """The secrets a backend gave this job: names and values for its
     process's environment. A name smith sets itself, or one the libraries
@@ -1381,7 +1422,7 @@ class Running:
         script = config.scripts[job["script"]] if self.code is None else ""
         #: What it trains with (GPU-523), which this machine must be able to make.
         self.template = self._checked_template(job, config)
-        env = dict(os.environ)
+        env = without_secrets(os.environ)
         # The secrets a backend gave this job: its HF_TOKEN, its W&B key. In
         # the training process's environment only - never this agent's own,
         # which outlives the job - and set first, so that nothing smith sets
@@ -1401,25 +1442,19 @@ class Running:
         # it - the job's owner's own - or else this agent's.
         own = Bucket.from_job(job["storage"]) if job.get("storage") else None
         bucket = own if own is not None else config.storage
-        # What is this agent's alone leaves the job's environment (GPU-465).
-        # Its token, under its own name: the run is given it as
-        # RAVEX_METRICS_TOKEN, where it is needed, and nowhere else. And its
-        # bucket's keys when the job brings a bucket of its own: one that
-        # came without keys is written with the machine's role, and with the
-        # agent's keys still there Moonclip took those instead.
-        env.pop("SMITH_TOKEN", None)
-        if own is not None:
-            for name in ("MOONCLIP_S3_ACCESS_KEY", "MOONCLIP_S3_SECRET_KEY", "MOONCLIP_S3_SESSION_TOKEN"):
-                env.pop(name, None)
+        # What is this agent's alone is not in the job's environment
+        # (``without_secrets``, GPU-465, GPU-530). Its token: the run is given
+        # it as RAVEX_METRICS_TOKEN, where it is needed, and nowhere else. Its
+        # bucket's keys: only when the job's store goes to that bucket
+        # (``Bucket.environment``); one the job brings without keys is written
+        # with the machine's role, and with the agent's keys there Moonclip
+        # took those instead.
         #: Every value the job's output must not carry back: its secrets, its
         #: bucket's keys, and this agent's token, which a script that prints
         #: its environment would otherwise send to whoever reads the logs.
         self.hidden = dict(self.secrets)
         if config.token:
             self.hidden["SMITH_TOKEN"] = config.token
-        for name in ("MOONCLIP_S3_ACCESS_KEY", "MOONCLIP_S3_SECRET_KEY", "MOONCLIP_S3_SESSION_TOKEN"):
-            if env.get(name):
-                self.hidden[name] = env[name]
         if token:
             self.hidden["RAVEX_JOB_TOKEN"] = token
         if bucket is not None and bucket.access_key and bucket.secret_key:
@@ -1815,7 +1850,9 @@ class Running:
         try:
             return subprocess.Popen(
                 [config.python, "-c", _PUSH_KERNELS, json.dumps(spec)],
-                env=dict(os.environ, **self.cache_env),
+                # In the job's environment, from its packages: no secret of this
+                # agent's but the cache's own (GPU-530).
+                env=dict(without_secrets(os.environ), **self.cache_env),
                 stdout=out,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
@@ -1879,8 +1916,10 @@ class Agent:
         self.logs_wait = 0.0
         self.logs_after = 0.0
         #: `ravex ship` reads the token from here, not from its command line,
-        #: where any user of the machine can see it.
-        self._ship_env = dict(os.environ)
+        #: where any user of the machine can see it; and no other secret of
+        #: this agent's, since it runs the job's Ravex, from the job's
+        #: environment (GPU-530).
+        self._ship_env = without_secrets(os.environ)
         if config.token:
             self._ship_env["RAVEX_METRICS_TOKEN"] = config.token
         #: Kernels of finished jobs on their way to their caches.

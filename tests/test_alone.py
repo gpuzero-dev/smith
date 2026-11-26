@@ -275,6 +275,54 @@ def test_a_job_is_not_given_what_is_the_agents_alone(tmp_path, monkeypatch):
     assert env["RAVEX_PRICE_PER_HOUR"] == "1.89"
 
 
+def test_the_machine_s_secrets_are_not_the_job_s(monkeypatch):
+    """The provider's key that deletes the pod, and this agent's bucket keys,
+    went to the job and to `ravex ship`, which run the job's code (GPU-530)."""
+    environ = {"PATH": "/bin", "RUNPOD_API_KEY": "rk", "CONTAINER_API_KEY": "vk", "SMITH_TOKEN": "t",
+               "MOONCLIP_S3_ACCESS_KEY": "a", "AWS_SECRET_ACCESS_KEY": "s", "SMITH_RUNTIME_URL": "https://m",
+               "CUDA_VISIBLE_DEVICES": "0", "MONKEY_BUSINESS": "kept"}
+    assert smith.without_secrets(environ) == {"PATH": "/bin", "SMITH_RUNTIME_URL": "https://m",
+                                              "CUDA_VISIBLE_DEVICES": "0", "MONKEY_BUSINESS": "kept"}
+    monkeypatch.setenv("RUNPOD_API_KEY", "rk")
+    agent = _agent()
+    agent.config.token = None
+    assert "RUNPOD_API_KEY" not in smith.Agent(agent.config)._ship_env
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a job is a process group, POSIX's")
+def test_the_agent_s_bucket_keys_go_only_where_the_store_goes(tmp_path, monkeypatch):
+    """To a job whose store is in this agent's bucket, and to no other
+    (GPU-530)."""
+    import json
+    import sys
+
+    script = tmp_path / "show.py"
+    script.write_text("import json, os; print(json.dumps(dict(os.environ)))")
+    monkeypatch.setenv("MOONCLIP_S3_ACCESS_KEY", "agents-key")
+    monkeypatch.setenv("MOONCLIP_S3_SECRET_KEY", "agents-secret")
+    monkeypatch.setenv("RUNPOD_API_KEY", "rk")
+    made(tmp_path / "runs")
+
+    def env_of(storage, job_id):
+        config = smith.Config(backend="http://127.0.0.1:1", name="n", hardware="h", runs=str(tmp_path / "runs"),
+                              python=sys.executable, scripts={"show": str(script)}, storage=storage, **RUNTIMES)
+        job = {"id": job_id, "script": "show", "mode": "fresh", "name": "n", "run_ref": "r-00%d" % job_id,
+               "params": {}, "template": TEMPLATE}
+        running = smith.Running(job, config)
+        running.process.wait(timeout=60)
+        with open(running.log_path, encoding="utf-8") as handle:
+            return json.loads(handle.read().strip().splitlines()[-1]), running
+
+    bucket = smith.Bucket.from_table({"type": "s3", "bucket": "agents", "region": "eu-west-1"}, "smith.toml")
+    env, running = env_of(bucket, 1)
+    assert env["RAVEX_STORAGE_BUCKET"] == "agents"
+    assert env["MOONCLIP_S3_ACCESS_KEY"] == "agents-key" and env["MOONCLIP_S3_SECRET_KEY"] == "agents-secret"
+    assert running.hidden["STORAGE_SECRET_KEY"] == "agents-secret"
+    assert "RUNPOD_API_KEY" not in env
+    env, _running = env_of(None, 2)
+    assert "MOONCLIP_S3_ACCESS_KEY" not in env and "RUNPOD_API_KEY" not in env
+
+
 def _gone(pid):
     """Whether ``pid`` is dead: a zombie nobody reaped counts, since it holds
     nothing (without --init, pytest may be the container's PID 1)."""

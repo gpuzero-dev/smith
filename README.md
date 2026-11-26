@@ -118,6 +118,16 @@ secret under such a name is dropped, and the log says so. It replaces
 their values with `[secret NAME]` in the output lines and failure messages it
 sends back.
 
+What smith itself holds stays its own: no variable of its environment whose
+name has a part `KEY`, `SECRET`, `TOKEN`, `PASSWORD` or `CREDENTIALS`
+(`SMITH_TOKEN`, `RUNPOD_API_KEY`, `CONTAINER_API_KEY`, `MOONCLIP_S3_*`,
+`AWS_SECRET_ACCESS_KEY`) reaches a job, `ravex ship` or the push of its
+kernels, which all run the job's packages. The agent's bucket keys go only to
+a job whose store is in the agent's bucket; a secret a job needs comes with
+the job. What this does not yet cover: the job runs as the agent's user, and
+it reports its metrics with the agent's own token (`RAVEX_METRICS_TOKEN`)
+until a backend hands one per job.
+
 A claimed job may also carry `storage`, a bucket with its keys
 (`type`, `bucket`, `prefix`, `endpoint`, `region`, `path_style`, `access_key`,
 `secret_key`, and `session_token` when the keys are temporary ones): that
