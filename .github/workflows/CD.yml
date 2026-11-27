@@ -104,12 +104,16 @@ jobs:
     needs: ci
     environment: production
     runs-on: ubuntu-latest
-    # id-token and attestations for the image's provenance (GPU-491).
+    # id-token and attestations for the image's provenance (GPU-491);
+    # artifact-metadata for the record GitHub keeps of where the attested
+    # image is stored, which the attest action writes too and only warns
+    # about when it may not.
     permissions:
       contents: read
       packages: write
       id-token: write
       attestations: write
+      artifact-metadata: write
     # Two pushes to deploy each get their image; neither is cancelled halfway,
     # which would leave a tag that does not exist after a push that said it
     # would. On the job, no longer on the workflow, for the reason above: the
